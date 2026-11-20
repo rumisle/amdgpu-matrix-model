@@ -1,0 +1,190 @@
+{
+  "target": "gfx1201",
+  "hardware": {
+    "gpu": "AMD Radeon RX 9070 XT",
+    "gfx_target": "gfx1201",
+    "hip_version": "7.1.52802",
+    "kernel_driver": "7.2.11-200.fc44.x86_64",
+    "capture_date": "2026-11-20"
+  },
+  "variants": [
+    {
+      "spec": "v_wmma_f32_16x16x16_f16",
+      "file": "v_wmma_f32_16x16x16_f16.mmbin",
+      "elements": 115456,
+      "waves": 451,
+      "bytes": 302294,
+      "sha256": "1c7c5799454d528e2f54f8aedfbd31f4c77ddc43ed68bacd50a6fe1e1c357dc9"
+    },
+    {
+      "spec": "v_wmma_f32_16x16x16_bf16",
+      "file": "v_wmma_f32_16x16x16_bf16.mmbin",
+      "elements": 115456,
+      "waves": 451,
+      "bytes": 177418,
+      "sha256": "4327b2d7f2eb0d262d348d77c8706204d2d22347dd9eb65fbbf3c306cde3776d"
+    },
+    {
+      "spec": "v_wmma_f16_16x16x16_f16",
+      "file": "v_wmma_f16_16x16x16_f16.mmbin",
+      "elements": 115456,
+      "waves": 451,
+      "bytes": 50849,
+      "sha256": "c8e99701dd89f7bf4cdcb67228b1620786f0b851444a72e453fd9b9e2ce94287"
+    },
+    {
+      "spec": "v_wmma_bf16_16x16x16_bf16",
+      "file": "v_wmma_bf16_16x16x16_bf16.mmbin",
+      "elements": 115456,
+      "waves": 451,
+      "bytes": 98072,
+      "sha256": "e0b00a9a06011fa70ca701fd7db70b6a6c006c3d69d668a015092e12a0202a8e"
+    },
+    {
+      "spec": "v_wmma_f32_16x16x16_fp8_fp8",
+      "file": "v_wmma_f32_16x16x16_fp8_fp8.mmbin",
+      "elements": 107264,
+      "waves": 419,
+      "bytes": 373641,
+      "sha256": "748b08ab05c4a3737ea0bc859ec1246b70cca81d5500fc0b93242c2964dc87ed"
+    },
+    {
+      "spec": "v_wmma_f32_16x16x16_fp8_bf8",
+      "file": "v_wmma_f32_16x16x16_fp8_bf8.mmbin",
+      "elements": 107264,
+      "waves": 419,
+      "bytes": 323281,
+      "sha256": "a984b744eef8f8a867d5428e190624c7dac7b8bfe069e3a59551f3afe59f1668"
+    },
+    {
+      "spec": "v_wmma_f32_16x16x16_bf8_fp8",
+      "file": "v_wmma_f32_16x16x16_bf8_fp8.mmbin",
+      "elements": 107520,
+      "waves": 420,
+      "bytes": 333100,
+      "sha256": "b25576ed7b13d7193f847f7a87686f5290aa3bd2e835277d08041eb2afc16114"
+    },
+    {
+      "spec": "v_wmma_f32_16x16x16_bf8_bf8",
+      "file": "v_wmma_f32_16x16x16_bf8_bf8.mmbin",
+      "elements": 108032,
+      "waves": 422,
+      "bytes": 297441,
+      "sha256": "c5c99d6b8bde9d59573563745a65a87c5b9ff2cba8f5fdcdb07a746aee2ea9a1"
+    },
+    {
+      "spec": "v_wmma_i32_16x16x16_iu8",
+      "file": "v_wmma_i32_16x16x16_iu8.mmbin",
+      "elements": 102400,
+      "waves": 400,
+      "bytes": 324026,
+      "sha256": "f35ff313635502e1b64ede34e7ba1dcfe57e83134dd80526e24d592333444495"
+    },
+    {
+      "spec": "v_wmma_i32_16x16x16_iu4",
+      "file": "v_wmma_i32_16x16x16_iu4.mmbin",
+      "elements": 102400,
+      "waves": 400,
+      "bytes": 348456,
+      "sha256": "363cfcf82a7e8a3ad9005655b7c7b56ef73691e6de8deec823d8b4adeafb7189"
+    },
+    {
+      "spec": "v_wmma_i32_16x16x32_iu4",
+      "file": "v_wmma_i32_16x16x32_iu4.mmbin",
+      "elements": 102400,
+      "waves": 400,
+      "bytes": 348290,
+      "sha256": "0e42ed2b764d36a4c7e0b3502eebea12cbbc0073e84dcc310becbb4bee25f075"
+    },
+    {
+      "spec": "v_swmmac_f32_16x16x32_f16",
+      "file": "v_swmmac_f32_16x16x32_f16.mmbin",
+      "elements": 102400,
+      "waves": 400,
+      "bytes": 294399,
+      "sha256": "a540cad557d69216cf70209e1dad7887116ee51686df2393663fbf4cbe40010c"
+    },
+    {
+      "spec": "v_swmmac_f32_16x16x32_bf16",
+      "file": "v_swmmac_f32_16x16x32_bf16.mmbin",
+      "elements": 102400,
+      "waves": 400,
+      "bytes": 172306,
+      "sha256": "96f44d6d5eab18667362c500d9ecdad60a75ce6e5772f0953ee7bc4bf7294117"
+    },
+    {
+      "spec": "v_swmmac_f16_16x16x32_f16",
+      "file": "v_swmmac_f16_16x16x32_f16.mmbin",
+      "elements": 102400,
+      "waves": 400,
+      "bytes": 51098,
+      "sha256": "393346d50067877eab7b79230395d511bc26a2984b9af70c8e7d82e8f746732a"
+    },
+    {
+      "spec": "v_swmmac_bf16_16x16x32_bf16",
+      "file": "v_swmmac_bf16_16x16x32_bf16.mmbin",
+      "elements": 102400,
+      "waves": 400,
+      "bytes": 96775,
+      "sha256": "84d28e8e553f1e336ddcdff7c02bc1fd2ba9e6d45f8783c41c31ab9ec869c92b"
+    },
+    {
+      "spec": "v_swmmac_f32_16x16x32_fp8_fp8",
+      "file": "v_swmmac_f32_16x16x32_fp8_fp8.mmbin",
+      "elements": 102400,
+      "waves": 400,
+      "bytes": 370308,
+      "sha256": "1627e47a27377b7cf593f7392937b23751ef940c7156dd8c43d13d12308ea69b"
+    },
+    {
+      "spec": "v_swmmac_f32_16x16x32_fp8_bf8",
+      "file": "v_swmmac_f32_16x16x32_fp8_bf8.mmbin",
+      "elements": 102400,
+      "waves": 400,
+      "bytes": 328863,
+      "sha256": "fe73e2ce4c0f6f8f6e33f3a51a9617de618f7880b93e6118d9b216ebf6af2276"
+    },
+    {
+      "spec": "v_swmmac_f32_16x16x32_bf8_fp8",
+      "file": "v_swmmac_f32_16x16x32_bf8_fp8.mmbin",
+      "elements": 102400,
+      "waves": 400,
+      "bytes": 329567,
+      "sha256": "672b624923f4757062ff1fb44531a827dc5b67148d6d5965964f06ff63704964"
+    },
+    {
+      "spec": "v_swmmac_f32_16x16x32_bf8_bf8",
+      "file": "v_swmmac_f32_16x16x32_bf8_bf8.mmbin",
+      "elements": 102400,
+      "waves": 400,
+      "bytes": 298734,
+      "sha256": "a561248b3b6a5dd9d60e6e4e72bb4f8bbb1c1268225b0396d4f98bcebbe79ab7"
+    },
+    {
+      "spec": "v_swmmac_i32_16x16x32_iu8",
+      "file": "v_swmmac_i32_16x16x32_iu8.mmbin",
+      "elements": 102400,
+      "waves": 400,
+      "bytes": 328883,
+      "sha256": "c55e706892fb85f18406214ff15103fc5057fa1ab6008cc00ed95ccfe098c62b"
+    },
+    {
+      "spec": "v_swmmac_i32_16x16x32_iu4",
+      "file": "v_swmmac_i32_16x16x32_iu4.mmbin",
+      "elements": 102400,
+      "waves": 400,
+      "bytes": 353982,
+      "sha256": "16b0be64a40a3e87bc1366a04322e78514247f1319d8e420324fdd53b9940ddf"
+    },
+    {
+      "spec": "v_swmmac_i32_16x16x64_iu4",
+      "file": "v_swmmac_i32_16x16x64_iu4.mmbin",
+      "elements": 102400,
+      "waves": 400,
+      "bytes": 348318,
+      "sha256": "ce30b0066908df201807d1f49c83a586674ebae71a83312ddf7dd58da645938c"
+    }
+  ],
+  "total_elements": 2325504,
+  "total_bytes": 5950101
+}
