@@ -100,11 +100,11 @@ def pack_float(units: int, grid: int, fmt: FloatFormat) -> int:
     return sign_bit | ((e + fmt.bias) << fmt.frac_bits) | (s & fmt.frac_mask)
 
 
-def _align_floor(sig: int, exp: int, neg: int, grid: int, is_acc: bool) -> int:
+def _align_floor(sig: int, exp: int, neg: int, grid: int, zero_if_empty: bool) -> int:
     """Align (-1)**neg * sig * 2**exp onto 2**grid by floor.
 
-    When `is_acc` is True, an accumulator shifted completely below the grid (mag == 0)
-    contributes 0 even when negative.
+    With `zero_if_empty`, a negative value shifted completely below the grid (magnitude 0)
+    contributes 0 instead of -1.
     """
     if sig == 0:
         return 0
@@ -115,7 +115,7 @@ def _align_floor(sig: int, exp: int, neg: int, grid: int, is_acc: bool) -> int:
     rsh = -shift
     mag = sig >> rsh
     if neg:
-        if is_acc and mag == 0:
+        if zero_if_empty and mag == 0:
             return 0
         tail = (sig & ((1 << rsh) - 1)) != 0
         return -mag - (1 if tail else 0)
@@ -186,7 +186,9 @@ def dot_float_step(
     c_grid = max(c_lead, d_fmt.emin) - 26
     grid = p_grid if p_grid > c_grid else c_grid
 
-    total = _align_floor(csig, cve, csg, grid, True)
+    # A negative accumulator shifted completely below the grid contributes 0 while the grid is above
+    # the D format's emin, and the ordinary floor (-1 unit) at or below it.
+    total = _align_floor(csig, cve, csg, grid, grid > d_fmt.emin)
     n = len(prods)
     for base in range(0, n, subgroup):
         sg = max(grids[base : base + subgroup])
