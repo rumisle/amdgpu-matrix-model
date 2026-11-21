@@ -1,403 +1,446 @@
-"""GPU-free validator checking the model bit-for-bit against all frozen gfx1201 hardware evidence.
+"""GPU-free validator: checks a model bit for bit against the frozen gfx1201 hardware evidence.
 
-Zero runtime dependencies (Python standard library only).
+Full validation (the default) is a release gate. It passes only if
+
+- the manifest has the pinned SHA-256 of this release (or the one given with --manifest-sha256),
+- the evidence directory holds exactly the release inventory (22 `.mmbin` files and the state file),
+  each with the size and SHA-256 the manifest lists,
+- every file parses under the strict schema of EVIDENCE.md, names the instruction its file name and
+  manifest entry name, and has exactly the manifest's chunks (tags, waves, input SHA-256),
+- every predicted D word list has exactly the hardware's length and every element is equal,
+- every state record of the release inventory is present and every recorded output is reproduced.
+
+`--variant NAME` validates only the named instructions (still after the full integrity check) and
+reports PARTIAL. Exit status: 0 pass, 1 mismatches, 2 malformed, missing or unexpected evidence.
 
 Usage:
-    python -m amdgpu_matrix_model.validation [--evidence DIR] [--variant NAME] [--workers N]
+    python -m amdgpu_matrix_model.validation [--evidence DIR] [--variant NAME ...] [--workers N]
 """
 
 from __future__ import annotations
 
 import argparse
-import array
-import json
 import os
-import struct
 import sys
 import time
-import zlib
+from collections.abc import Callable
 from concurrent.futures import ProcessPoolExecutor
+from dataclasses import dataclass, field
 from pathlib import Path
 
+from .evidence import (
+    CONTROL_OPERANDS,
+    CONTROL_RESULTS,
+    CONTROL_WRITES,
+    MANIFEST_FORMAT,
+    STATE_FILE,
+    STATE_PREFILL,
+    STATE_STORE_DWORDS,
+    TARGET,
+    EvidenceError,
+    decode_vop3p,
+    expected_files,
+    inputs_sha256,
+    is_u,
+    iter_chunk_data,
+    probe_fields,
+    probe_runs,
+    read_manifest,
+    read_matrix_file,
+    read_state_file,
+    sha256_file,
+    state_probes,
+)
 from .model import wmma_wave
 from .specs import SPECS, WmmaSpec
 
-MAGIC = b"AMDMAT02"
-STATE_MAGIC = b"AMDST001"
-_MASK64 = 0xFFFF_FFFF_FFFF_FFFF
-_VALID_24_NIBBLES = (0x4, 0x8, 0xC, 0x9, 0xD, 0xE)
+# SHA-256 of evidence/manifest.json of this release. The manifest in turn pins every evidence file.
+RELEASE_MANIFEST_SHA256 = "0000000000000000000000000000000000000000000000000000000000000000"
+
+WaveModel = Callable[..., list[int]]  # signature of model.wmma_wave
 
 
-class SplitMix64:
-    """Standard 64-bit SplitMix64 PRNG (zero external dependencies)."""
+@dataclass
+class Tally:
+    """Separate counters; every pair is (checked, mismatched) in one unit."""
 
-    __slots__ = ("state",)
+    elements: int = 0  # D elements (one per f32/i32 word, two per f16/bf16 word)
+    element_mm: int = 0
+    preserved: int = 0  # destination words past D that must keep their prefill value
+    preserved_mm: int = 0
+    control: int = 0  # MODE control-row values
+    control_mm: int = 0
+    details: list[str] = field(default_factory=list)
 
-    def __init__(self, seed: int) -> None:
-        self.state = seed & _MASK64
+    @property
+    def mismatches(self) -> int:
+        return self.element_mm + self.preserved_mm + self.control_mm
 
-    def next_u64(self) -> int:
-        s = (self.state + 0x9E37_79B9_7F4A_7C15) & _MASK64
-        self.state = s
-        z = ((s ^ (s >> 30)) * 0xBF58_476D_1CE4_E5B9) & _MASK64
-        z = ((z ^ (z >> 27)) * 0x94D0_49BB_1331_11EB) & _MASK64
-        return (z ^ (z >> 31)) & _MASK64
+    def note(self, msg: str) -> None:
+        if len(self.details) < 8:
+            self.details.append(msg)
 
-    def next_u32(self) -> int:
-        return self.next_u64() & 0xFFFF_FFFF
-
-
-def _transform_finite_word(u: int, fmt: str, idx: int, count: int) -> int:
-    """Map one raw uint32 word deterministically into a finite (incl. subnormal) packed word."""
-    if fmt == "f16":
-        lo = u & 0xFFFF
-        hi = u >> 16
-        if (lo & 0x7C00) == 0x7C00:
-            lo &= 0x83FF
-        if (hi & 0x7C00) == 0x7C00:
-            hi &= 0x83FF
-        return lo | (hi << 16)
-    if fmt == "bf16":
-        half = count >> 1
-        out = 0
-        for sh in (0, 16):
-            h = (u >> sh) & 0xFFFF
-            if (h & 0x0F) == 0:
-                h &= 0x807F
-            elif idx < half:
-                exp = 96 + (((h >> 7) & 0xFF) & 0x3F)
-                h = (h & 0x807F) | (exp << 7)
-            elif (h & 0x7F80) == 0x7F80:
-                h &= 0x807F
-            out |= h << sh
-        return out
-    if fmt == "fp8":
-        out = 0
-        for sh in (0, 8, 16, 24):
-            b = (u >> sh) & 0xFF
-            if (b & 0x7F) == 0x7F:
-                b &= 0xFE
-            out |= b << sh
-        return out
-    if fmt == "bf8":
-        out = 0
-        for sh in (0, 8, 16, 24):
-            b = (u >> sh) & 0xFF
-            if (b & 0x7C) == 0x7C:
-                b &= 0x83
-            out |= b << sh
-        return out
-    # f32
-    q3 = (count * 3) >> 2
-    if (u & 0x0F) == 0:
-        return u & 0x807F_FFFF
-    if idx < q3:
-        exp = 96 + (((u >> 23) & 0xFF) & 0x3F)
-        return (u & 0x807F_FFFF) | (exp << 23)
-    if (u & 0x7F80_0000) == 0x7F80_0000:
-        return u & 0x807F_FFFF
-    return u
+    def add(self, other: Tally) -> None:
+        for k in ("elements", "element_mm", "preserved", "preserved_mm", "control", "control_mm"):
+            setattr(self, k, getattr(self, k) + getattr(other, k))
 
 
-def _gen_sparse_idx(rng: SplitMix64, waves: int) -> list[int]:
-    """First half of waves use valid 2:4 index nibbles; second half use raw uint32 words."""
-    half_words = (waves // 2) * 32
-    total_words = waves * 32
-    out = [0] * total_words
-    for i in range(half_words):
-        u = rng.next_u64()
-        w = 0
-        for nib in range(8):
-            w |= _VALID_24_NIBBLES[((u >> (8 * nib)) & 0xFF) % 6] << (4 * nib)
-        out[i] = w
-    for i in range(half_words, total_words):
-        out[i] = rng.next_u32()
-    return out
+def compare_d(spec: WmmaSpec, hw: list[int], pred: list[int], tally: Tally, where: str) -> None:
+    """Compare one wave's D words element by element; lengths must match exactly."""
+    if type(pred) is not list or len(pred) != len(hw):
+        raise EvidenceError(f"{where}: model returned {len(pred) if hasattr(pred, '__len__') else pred!r} words, hardware has {len(hw)}")
+    per = 32 // spec.d_bits
+    mask = (1 << spec.d_bits) - 1
+    tally.elements += per * len(hw)
+    for i, (h, p) in enumerate(zip(hw, pred)):
+        if h != p:
+            if type(p) is not int:
+                raise EvidenceError(f"{where}: model word {p!r} is not an int")
+            n = sum(((h >> (s * spec.d_bits)) & mask) != ((p >> (s * spec.d_bits)) & mask) for s in range(per))
+            tally.element_mm += n
+            tally.note(f"{where} word {i}: hw={h:#010x} model={p:#010x}")
 
 
-def generate_chunk_inputs(
-    spec: WmmaSpec, waves: int, seed: int, gen: str
-) -> tuple[list[int], list[int], list[int], list[int] | None]:
-    """Deterministically generate (A, B, C, IDX) uint32 word lists from (seed, gen) using SplitMix64."""
-    rng = SplitMix64(seed)
-    na = waves * 32 * spec.a_dwords
-    nb = waves * 32 * spec.b_dwords
-    nc = waves * 32 * spec.cd_dwords
+# --- matrix files ------------------------------------------------------------------------------
 
-    if gen == "raw":
-        a = [rng.next_u32() for _ in range(na)]
-        b = [rng.next_u32() for _ in range(nb)]
-        c = [rng.next_u32() for _ in range(nc)]
-    elif gen == "finite":
-        a = [_transform_finite_word(rng.next_u32(), spec.a_fmt, i, na) for i in range(na)]
-        b = [_transform_finite_word(rng.next_u32(), spec.b_fmt, i, nb) for i in range(nb)]
-        c = [_transform_finite_word(rng.next_u32(), spec.d_fmt, i, nc) for i in range(nc)]
-    elif gen == "clamp_stress":
-        a = [rng.next_u32() for _ in range(na)]
-        b = [rng.next_u32() for _ in range(nb)]
-        half = nc >> 1
-        c = [
-            (((0x7FFF_FFFF if i < half else 0x8000_0000) + ((rng.next_u32() & 0xFFFF) - 32768)) & 0xFFFF_FFFF)
-            for i in range(nc)
-        ]
-    else:
-        raise ValueError(f"Unknown chunk generator: {gen!r}")
 
-    idx = _gen_sparse_idx(rng, waves) if spec.sparse else None
-    return a, b, c, idx
+def validate_matrix_file(path: Path, entry: dict, model: WaveModel = wmma_wave) -> Tally:
+    """Validate one `.mmbin` against its manifest entry and the model."""
+    mf = read_matrix_file(path, entry["spec"])
+    spec = mf.spec
+    if [c.tag for c in mf.chunks] != [c["tag"] for c in entry["chunks"]]:
+        raise EvidenceError(f"{path.name}: chunk list differs from the manifest")
+    tally = Tally()
+    a_per, b_per, cd_per = 32 * spec.a_dwords, 32 * spec.b_dwords, 32 * spec.cd_dwords
+    for (ch, a, b, c, idx, d), m in zip(iter_chunk_data(mf), entry["chunks"]):
+        if ch.waves != m["waves"] or inputs_sha256(a, b, c, idx) != m["inputs_sha256"]:
+            raise EvidenceError(f"{path.name}:{ch.tag}: waves or input SHA-256 differ from the manifest")
+        for w in range(ch.waves):
+            pred = model(
+                spec.name,
+                a[w * a_per : (w + 1) * a_per],
+                b[w * b_per : (w + 1) * b_per],
+                c[w * cd_per : (w + 1) * cd_per],
+                idx_words=idx[w * 32 : (w + 1) * 32] if idx is not None else None,
+                index_key=ch.index_key,
+                neg_lo=ch.neg_lo,
+                neg_hi=ch.neg_hi,
+                clamp=ch.clamp,
+            )
+            compare_d(spec, d[w * cd_per : (w + 1) * cd_per], pred, tally, f"{ch.tag} wave {w}")
+    if tally.elements != 256 * sum(c.waves for c in mf.chunks) or tally.elements != entry["elements"]:
+        raise EvidenceError(f"{path.name}: compared {tally.elements} elements, manifest lists {entry['elements']}")
+    return tally
+
+
+# --- state file --------------------------------------------------------------------------------
+
+
+def expected_control(write: int) -> dict[str, int]:
+    """MODE readbacks and VALU results implied by the RDNA4 MODE fields for a value written to [15:0].
+
+    Only MODE[7:0] is writable (FP_ROUND [3:0]: f32 [1:0], f16/f64 [3:2]; FP_DENORM [7:4]: f32 [5:4],
+    f16/f64 [7:6]; denorm bit 0 keeps input denormals, bit 1 output denormals; round 1 = toward +inf).
+    """
+    m = write & 0xFF
+    return {
+        "init": 0x00F0,
+        "read": m,
+        "read_after_s_round_mode_15": (m & 0xF0) | 0x0F,
+        "read_after_s_denorm_mode_15": 0xFF,
+        "f32_add_rne_tie": 0x3F80_0001 if (m & 3) == 1 else 0x3F80_0000,
+        "f32_add_denorm_in": 0x0080_0000 if (m >> 4) & 1 else 0,
+        "f32_sub_denorm_out": 0x0040_0000 if (m >> 5) & 1 else 0,
+        "f16_add_rne_tie": 0x3C01 if ((m >> 2) & 3) == 1 else 0x3C00,
+        "f16_add_denorm_in": 0x0400 if (m >> 6) & 1 else 0,
+        "f16_sub_denorm_out": 0x0200 if (m >> 7) & 1 else 0,
+    }
+
+
+def _check_keys(rec: dict, keys: set[str], what: str) -> None:
+    if not isinstance(rec, dict) or set(rec) != keys:
+        raise EvidenceError(f"{what}: fields {sorted(rec) if isinstance(rec, dict) else rec!r} != {sorted(keys)}")
+
+
+def _words(v, n: int, what: str) -> list[int]:
+    if not isinstance(v, list) or len(v) != n or not all(is_u(x, 32) for x in v):
+        raise EvidenceError(f"{what}: needs exactly {n} u32 words")
+    return v
+
+
+_WMMA_KEYS = {
+    "kind", "probe", "spec", "encoding", "index_key", "neg_lo", "neg_hi", "clamp", "op_sel", "op_sel_hi",
+    "store_dwords", "prefill", "waves", "a", "b", "c", "idx", "runs",
+}  # fmt: skip
+
+
+def check_state_schema(doc: dict) -> tuple[list[dict], list[dict]]:
+    """Check every record and the exact release inventory; return (control rows, wmma records)."""
+    controls, wmmas = [], []
+    for n, rec in enumerate(doc["records"]):
+        kind = rec.get("kind") if isinstance(rec, dict) else None
+        if kind == "mode_control":
+            _check_keys(rec, {"kind", "write", "operands", "results"}, f"record {n}")
+            if rec["operands"] != {k: list(v) for k, v in CONTROL_OPERANDS.items()}:
+                raise EvidenceError(f"record {n}: control operands differ from EVIDENCE.md")
+            _check_keys(rec["results"], set(CONTROL_RESULTS), f"record {n} results")
+            if not is_u(rec["write"], 16) or not all(is_u(v, 32) for v in rec["results"].values()):
+                raise EvidenceError(f"record {n}: control values out of range")
+            controls.append(rec)
+        elif kind == "wmma":
+            _check_keys(rec, _WMMA_KEYS, f"record {n}")
+            spec = SPECS.get(rec["spec"])
+            if spec is None or rec["probe"] not in state_probes(spec):
+                raise EvidenceError(f"record {n}: unknown probe {rec['probe']!r} for {rec['spec']!r}")
+            where = f"record {n} ({rec['probe']} {spec.name})"
+            want = probe_fields(spec, rec["probe"])
+            if {k: rec[k] for k in want} != want:
+                raise EvidenceError(f"{where}: fields differ from the probe definition")
+            enc = rec["encoding"]
+            if not isinstance(enc, list) or len(enc) != 2 or not all(is_u(x, 32) for x in enc):
+                raise EvidenceError(f"{where}: encoding must be two u32 words")
+            f = decode_vop3p(*enc)
+            op_sel = (f["op_sel"] & ~1) if spec.sparse else f["op_sel"]
+            key = f["op_sel"] & 1 if spec.sparse else 0
+            if (f["encoding"], f["op"]) != (0xCC, spec.opcode) or [f["neg_lo"], f["neg_hi"], f["clamp"], op_sel, f["op_sel_hi"], key] != [
+                rec["neg_lo"], rec["neg_hi"], rec["clamp"], rec["op_sel"], rec["op_sel_hi"], rec["index_key"]
+            ]:  # fmt: skip
+                raise EvidenceError(f"{where}: encoding does not decode to the recorded fields")
+            if rec["store_dwords"] != STATE_STORE_DWORDS or rec["prefill"] != STATE_PREFILL:
+                raise EvidenceError(f"{where}: store_dwords / prefill differ from EVIDENCE.md")
+            w = rec["waves"]
+            if not is_u(w, 8) or w < 1:
+                raise EvidenceError(f"{where}: bad wave count")
+            _words(rec["a"], w * 32 * spec.a_dwords, f"{where} a")
+            _words(rec["b"], w * 32 * spec.b_dwords, f"{where} b")
+            _words(rec["c"], w * 32 * spec.cd_dwords, f"{where} c")
+            if spec.sparse:
+                _words(rec["idx"], w * 32, f"{where} idx")
+            elif rec["idx"] is not None:
+                raise EvidenceError(f"{where}: dense forms have idx null")
+            runs = rec["runs"]
+            if not isinstance(runs, list) or [(r.get("mode"), r.get("exec_lo")) for r in runs] != probe_runs(rec["probe"]):
+                raise EvidenceError(f"{where}: runs differ from the probe definition")
+            for r in runs:
+                _check_keys(r, {"mode", "exec_lo", "d"}, where)
+                _words(r["d"], w * 32 * STATE_STORE_DWORDS, f"{where} d")
+            wmmas.append(rec)
+        else:
+            raise EvidenceError(f"record {n}: unknown kind {kind!r}")
+    if [r["write"] for r in controls] != list(CONTROL_WRITES):
+        raise EvidenceError("state: MODE control rows differ from the release inventory")
+    have = [(r["spec"], r["probe"]) for r in wmmas]
+    want = [(s.name, p) for s in SPECS.values() for p in state_probes(s)]
+    if have != want:
+        raise EvidenceError(f"state: WMMA records differ from the release inventory ({len(have)} vs {len(want)})")
+    return controls, wmmas
+
+
+def state_summary(path: Path) -> dict:
+    """Record and check counts of a state file (schema-checked; no model involved)."""
+    controls, wmmas = check_state_schema(read_state_file(path))
+    checks = len(controls) * len(CONTROL_RESULTS)
+    for rec in wmmas:
+        spec = SPECS[rec["spec"]]
+        per_wave = 256 + 32 * (STATE_STORE_DWORDS - spec.cd_dwords)
+        checks += per_wave * rec["waves"] * len(rec["runs"])
+    return {"records": len(controls) + len(wmmas), "checks": checks}
+
+
+def validate_state_file(path: Path, model: WaveModel = wmma_wave) -> Tally:
+    """Reproduce every state record: control rows from MODE semantics, WMMA runs with the model."""
+    controls, wmmas = check_state_schema(read_state_file(path))
+    tally = Tally()
+    for rec in controls:
+        exp = expected_control(rec["write"])
+        for k, v in exp.items():
+            tally.control += 1
+            if rec["results"][k] != v:
+                tally.control_mm += 1
+                tally.note(f"control write={rec['write']:#06x} {k}: hw={rec['results'][k]:#x} expected={v:#x}")
+    for rec in wmmas:
+        spec = SPECS[rec["spec"]]
+        a_per, b_per, cd_per = 32 * spec.a_dwords, 32 * spec.b_dwords, 32 * spec.cd_dwords
+        for r in rec["runs"]:
+            for w in range(rec["waves"]):
+                pred = model(
+                    spec.name,
+                    rec["a"][w * a_per : (w + 1) * a_per],
+                    rec["b"][w * b_per : (w + 1) * b_per],
+                    rec["c"][w * cd_per : (w + 1) * cd_per],
+                    idx_words=rec["idx"][w * 32 : (w + 1) * 32] if spec.sparse else None,
+                    index_key=rec["index_key"],
+                    neg_lo=rec["neg_lo"],
+                    neg_hi=rec["neg_hi"],
+                    clamp=rec["clamp"],
+                    op_sel=rec["op_sel"],
+                    op_sel_hi=rec["op_sel_hi"],
+                    mode=r["mode"],
+                    exec_lo=r["exec_lo"],
+                )
+                stored = r["d"][w * 32 * STATE_STORE_DWORDS : (w + 1) * 32 * STATE_STORE_DWORDS]
+                d_hw, kept = [], []
+                for lane in range(32):
+                    row = stored[lane * STATE_STORE_DWORDS : (lane + 1) * STATE_STORE_DWORDS]
+                    d_hw += row[: spec.cd_dwords]
+                    kept += row[spec.cd_dwords :]
+                where = f"state {rec['probe']} {spec.name} mode={r['mode']:#06x} exec={r['exec_lo']:#010x} wave {w}"
+                compare_d(spec, d_hw, pred, tally, where)
+                tally.preserved += len(kept)
+                bad = sum(x != STATE_PREFILL for x in kept)
+                tally.preserved_mm += bad
+                if bad:
+                    tally.note(f"{where}: {bad} words past D were overwritten")
+    return tally
+
+
+# --- manifest and driver -----------------------------------------------------------------------
 
 
 def default_evidence_dir() -> Path:
     here = Path(__file__).resolve().parent
-    for cand in (here.parent / "evidence", here / "evidence", Path.cwd() / "evidence"):
+    for cand in (here.parent / "evidence", Path.cwd() / "evidence"):
         if cand.is_dir():
             return cand
     return here.parent / "evidence"
 
 
-def read_evidence_file(path: Path) -> tuple[dict, array.array]:
-    """Read a compact `.mmbin` evidence file into (header_dict, uint32_array)."""
-    raw = path.read_bytes()
-    if len(raw) < 12 or raw[:8] != MAGIC:
-        raise ValueError(f"{path}: invalid magic header (expected {MAGIC!r})")
-    hdr_len = struct.unpack_from("<I", raw, 8)[0]
-    hdr_end = 12 + hdr_len
-    header = json.loads(raw[12:hdr_end].decode("utf-8"))
-    payload = zlib.decompress(raw[hdr_end:])
-    words = array.array("I")
-    words.frombytes(payload)
-    if sys.byteorder != "little":
-        words.byteswap()
-    return header, words
+def check_inventory(ev_dir: Path, manifest_sha256: str) -> dict:
+    """Pinned manifest, exact file inventory, sizes and hashes; return the manifest."""
+    mpath = ev_dir / "manifest.json"
+    if not mpath.is_file():
+        raise EvidenceError(f"{mpath} not found")
+    if sha256_file(mpath) != manifest_sha256:
+        raise EvidenceError(f"manifest.json SHA-256 {sha256_file(mpath)} is not the trusted {manifest_sha256}")
+    m = read_manifest(mpath)
+    if set(m) != {"format", "target", "sessions", "files", "totals"} or m["format"] != MANIFEST_FORMAT or m["target"] != TARGET:
+        raise EvidenceError("manifest.json: unsupported format or target")
+    names = [f.get("file") for f in m["files"]]
+    if names != expected_files():
+        raise EvidenceError("manifest.json does not list exactly the release inventory")
+    present = sorted(p.name for p in ev_dir.iterdir() if p.suffix in (".mmbin", ".mmstate"))
+    if present != sorted(names):
+        raise EvidenceError(f"evidence directory holds {present} instead of the manifest's files")
+    sessions = {s["id"] for s in m["sessions"]}
+    for f in m["files"]:
+        p = ev_dir / f["file"]
+        if p.stat().st_size != f["bytes"] or sha256_file(p) != f["sha256"]:
+            raise EvidenceError(f"{f['file']}: size or SHA-256 differs from the manifest")
+        if f["kind"] == "matrix":
+            if f["file"] != f"{f['spec']}.mmbin" or any(c["session"] not in sessions for c in f["chunks"]):
+                raise EvidenceError(f"{f['file']}: manifest entry names another instruction or session")
+            if f["elements"] != 256 * f["waves"] or f["waves"] != sum(c["waves"] for c in f["chunks"]):
+                raise EvidenceError(f"{f['file']}: manifest counts are inconsistent")
+        elif f["session"] not in sessions:
+            raise EvidenceError(f"{f['file']}: manifest entry names an unknown session")
+    mats = [f for f in m["files"] if f["kind"] == "matrix"]
+    t = m["totals"]
+    if (t["matrix_files"], t["matrix_elements"], t["bytes"]) != (len(mats), sum(f["elements"] for f in mats), sum(f["bytes"] for f in m["files"])):
+        raise EvidenceError("manifest.json: totals do not add up")
+    return m
 
 
-def write_evidence_file(path: Path, header: dict, words: array.array) -> None:
-    """Write a compact `.mmbin` evidence file (magic + JSON header + zlib u32 payload)."""
-    hdr_bytes = json.dumps(header, separators=(",", ":")).encode("utf-8")
-    out_words = array.array("I", words)
-    if sys.byteorder != "little":
-        out_words.byteswap()
-    comp = zlib.compress(out_words.tobytes(), level=6)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(MAGIC + struct.pack("<I", len(hdr_bytes)) + hdr_bytes + comp)
-
-
-def validate_state_file(path: Path) -> tuple[int, int]:
-    """Validate frozen hardware state probes (MODE, raw clamp, sentinel/op_sel, EXEC masking)."""
-    raw = path.read_bytes()
-    if len(raw) < 8 or raw[:8] != STATE_MAGIC:
-        raise ValueError(f"{path}: invalid state magic")
-    doc = json.loads(zlib.decompress(raw[8:]).decode("utf-8"))
-    checks = 0
-    mismatches = 0
-
-    by_mode = {row["write"]: row for row in doc["mode_ctrl"]}
-    ctrl_asserts = [
-        by_mode[0x00F0]["f32_tie"] == 0x3F80_0000 and by_mode[0x00F1]["f32_tie"] == 0x3F80_0001,
-        by_mode[0x00F0]["f16_tie"] == 0x3C00 and by_mode[0x00F4]["f16_tie"] == 0x3C01,
-        by_mode[0x00F0]["f32_sub"] == 0x0080_0000 and by_mode[0x00C0]["f32_sub"] == 0x0000_0000,
-        by_mode[0x00F0]["f16_sub"] == 0x0400 and by_mode[0x0030]["f16_sub"] == 0x0000,
-        by_mode[0xFFF0]["read"] == 0x0000_00F0,
-    ]
-    checks += len(ctrl_asserts)
-    mismatches += sum(1 for ok in ctrl_asserts if not ok)
-
-    for entry in doc["mode_wmma"]:
-        spec = SPECS[entry["spec"]]
-        wpm = int(entry["waves_per_mode"])
-        a_per, b_per, cd_per = 32 * spec.a_dwords, 32 * spec.b_dwords, 32 * spec.cd_dwords
-        expected_waves = []
-        for w in range(wpm):
-            expected_waves.extend(
-                wmma_wave(
-                    spec.name,
-                    entry["a"][w * a_per : (w + 1) * a_per],
-                    entry["b"][w * b_per : (w + 1) * b_per],
-                    entry["c"][w * cd_per : (w + 1) * cd_per],
-                )
-            )
-        for d_hw in entry["d_by_mode"]:
-            checks += wpm * 256
-            if d_hw != expected_waves:
-                mismatches += 1
-
-    for entry in doc["raw_clamp"]:
-        pred = wmma_wave(entry["spec"], entry["a"], entry["b"], entry["c"])
-        checks += 256
-        if entry["d_hw"] != pred:
-            mismatches += 1
-
-    for entry in doc["sentinel_opsel"]:
-        pred = wmma_wave(entry["spec"], entry["a"], entry["b"], entry["c"])
-        d8 = entry["d_sentinel_8dw"]
-        lo4 = [w for lane in range(32) for w in d8[lane * 8 : lane * 8 + 4]]
-        hi4 = [w for lane in range(32) for w in d8[lane * 8 + 4 : lane * 8 + 8]]
-        checks += 256 * 3
-        if lo4 != pred or any(w != 0xDEAD_BEEF for w in hi4):
-            mismatches += 1
-        if entry["d_rawopsel_7"] != pred:
-            mismatches += 1
-        if entry["d_rawopsel_hi0"] != pred:
-            mismatches += 1
-
-    for entry in doc["exec_mask"]:
-        pred = wmma_wave(entry["spec"], entry["a"], entry["b"], entry["c"], idx_words=entry["idx"])
-        for d_hw in entry["d_by_mask"]:
-            checks += 256
-            if d_hw != pred:
-                mismatches += 1
-
-    return checks, mismatches
-
-
-def _validate_file(path_str: str) -> tuple[str, int, int, list[str], float]:
+def _run_file(args: tuple[str, dict]) -> tuple[str, Tally, str | None, float]:
     t0 = time.monotonic()
-    path = Path(path_str)
-    header, words = read_evidence_file(path)
-    spec_name = header["spec"]
-    spec = SPECS[spec_name]
-
-    a_per = 32 * spec.a_dwords
-    b_per = 32 * spec.b_dwords
-    cd_per = 32 * spec.cd_dwords
-    idx_per = 32 if spec.sparse else 0
-
-    pos = 0
-    total_elems = 0
-    mismatches = 0
-    details: list[str] = []
-
-    for chunk in header["chunks"]:
-        waves = int(chunk["waves"])
-        tag = chunk["tag"]
-        gen = chunk.get("gen", "explicit")
-        ik = int(chunk.get("index_key", 0))
-        nlo = tuple(chunk.get("neg_lo", (0, 0, 0)))
-        nhi = tuple(chunk.get("neg_hi", (0, 0, 0)))
-        cl = bool(chunk.get("clamp", False))
-
-        c_len = waves * cd_per
-        if gen == "explicit":
-            a_len = waves * a_per
-            b_len = waves * b_per
-            i_len = waves * idx_per
-            a_slice = words[pos : pos + a_len]
-            pos += a_len
-            b_slice = words[pos : pos + b_len]
-            pos += b_len
-            c_slice = words[pos : pos + c_len]
-            pos += c_len
-            idx_slice = words[pos : pos + i_len] if spec.sparse else None
-            pos += i_len
-        else:
-            a_slice, b_slice, c_slice, idx_slice = generate_chunk_inputs(spec, waves, int(chunk["seed"]), gen)
-
-        d_slice = words[pos : pos + c_len]
-        pos += c_len
-
-        for w in range(waves):
-            aw = a_slice[w * a_per : (w + 1) * a_per]
-            bw = b_slice[w * b_per : (w + 1) * b_per]
-            cw = c_slice[w * cd_per : (w + 1) * cd_per]
-            dw = d_slice[w * cd_per : (w + 1) * cd_per]
-            iw = idx_slice[w * idx_per : (w + 1) * idx_per] if idx_slice is not None else None
-            pred = wmma_wave(
-                spec_name,
-                aw,
-                bw,
-                cw,
-                idx_words=iw,
-                index_key=ik,
-                neg_lo=nlo,
-                neg_hi=nhi,
-                clamp=cl,
-            )
-            total_elems += 256
-            if list(dw) != pred:
-                if spec.d_bits == 32:
-                    for k_w, (hw_w, pr_w) in enumerate(zip(dw, pred)):
-                        if hw_w != pr_w:
-                            mismatches += 1
-                            if len(details) < 5:
-                                details.append(f"{tag} w={w} dw={k_w}: hw={hw_w:#010x} pred={pr_w:#010x}")
-                else:
-                    for k_w, (hw_w, pr_w) in enumerate(zip(dw, pred)):
-                        if hw_w != pr_w:
-                            if (hw_w & 0xFFFF) != (pr_w & 0xFFFF):
-                                mismatches += 1
-                            if (hw_w >> 16) != (pr_w >> 16):
-                                mismatches += 1
-                            if len(details) < 5:
-                                details.append(f"{tag} w={w} dw={k_w}: hw={hw_w:#010x} pred={pr_w:#010x}")
-
-    if pos != len(words):
-        raise ValueError(f"{path}: trailing words ({pos} != {len(words)})")
-    return spec_name, total_elems, mismatches, details, time.monotonic() - t0
+    path, entry = args
+    try:
+        return entry["spec"], validate_matrix_file(Path(path), entry), None, time.monotonic() - t0
+    except EvidenceError as e:
+        return entry["spec"], Tally(), str(e), time.monotonic() - t0
 
 
 def validate(
     evidence_dir: Path | None = None,
     variants: list[str] | None = None,
     workers: int | None = None,
+    manifest_sha256: str = RELEASE_MANIFEST_SHA256,
+    model: WaveModel = wmma_wave,
+    out=sys.stdout,
 ) -> int:
     ev_dir = evidence_dir or default_evidence_dir()
-    files = sorted(ev_dir.glob("*.mmbin")) if ev_dir.is_dir() else []
-    if variants:
-        want = set(variants)
-        files = [f for f in files if f.stem in want]
-    if not files:
-        print(
-            f"No .mmbin evidence files found in {ev_dir}.\n"
-            "Frozen evidence is shipped in the repository checkout (not inside the installed wheel).\n"
-            "Run from a repository checkout or pass --evidence PATH_TO_EVIDENCE_DIR.",
-            file=sys.stderr,
-        )
-        return 2
-
-    n_workers = workers if workers is not None else min(os.cpu_count() or 1, len(files), 16)
     t0 = time.monotonic()
-    if n_workers <= 1 or len(files) == 1:
-        results = [_validate_file(str(f)) for f in files]
+    try:
+        manifest = check_inventory(ev_dir, manifest_sha256)
+    except (EvidenceError, OSError) as e:
+        print(f"[ERROR] {e}", file=out)
+        return 2
+    print(f"[PASS] manifest {manifest_sha256[:16]}...: {len(manifest['files'])} files present, sizes and SHA-256 match", file=out)
+    entries = {f["spec"]: f for f in manifest["files"] if f["kind"] == "matrix"}
+    selected = list(SPECS) if not variants else variants
+    unknown = [v for v in selected if v not in SPECS and v != "state"]
+    if unknown:
+        print(f"[ERROR] unknown instruction(s): {', '.join(unknown)}", file=out)
+        return 2
+    full = not variants
+    jobs = [(str(ev_dir / entries[s]["file"]), entries[s]) for s in selected if s in SPECS]
+    n_workers = workers if workers is not None else min(os.cpu_count() or 1, max(1, len(jobs)), 16)
+    if model is not wmma_wave or n_workers <= 1 or len(jobs) <= 1:
+        results = []
+        for path, entry in jobs:
+            t1 = time.monotonic()
+            try:
+                results.append((entry["spec"], validate_matrix_file(Path(path), entry, model), None, time.monotonic() - t1))
+            except EvidenceError as e:
+                results.append((entry["spec"], Tally(), str(e), time.monotonic() - t1))
     else:
         with ProcessPoolExecutor(max_workers=n_workers) as ex:
-            results = list(ex.map(_validate_file, [str(f) for f in files]))
+            results = list(ex.map(_run_file, jobs))
 
-    grand_elems = 0
-    grand_mm = 0
-    for spec_name, elems, mm, details, dt in results:
-        grand_elems += elems
-        grand_mm += mm
-        status = "PASS" if mm == 0 else "FAIL"
-        print(f"[{status}] {spec_name:34s}: {elems - mm:7d}/{elems:7d} bit-exact ({mm} mismatches) [{dt:.2f}s]")
-        for d in details:
-            print(f"   {d}")
+    total, errors = Tally(), 0
+    for name, tl, err, dt in results:
+        if err:
+            errors += 1
+            print(f"[ERROR] {name:34s}: {err}", file=out)
+            continue
+        total.add(tl)
+        status = "PASS" if tl.mismatches == 0 else "FAIL"
+        print(f"[{status}] {name:34s}: {tl.elements - tl.element_mm:7d}/{tl.elements:7d} elements bit-exact [{dt:.2f}s]", file=out)
+        for d in tl.details:
+            print(f"   {d}", file=out)
 
-    state_path = ev_dir / "state_gfx1201.mmstate"
-    if not variants and state_path.is_file():
-        t_s = time.monotonic()
-        st_checks, state_mm = validate_state_file(state_path)
-        st_status = "PASS" if state_mm == 0 else "FAIL"
-        print(
-            f"[{st_status}] {'state_gfx1201 (MODE/clamp/op_sel/EXEC)':34s}: "
-            f"{st_checks - state_mm:7d}/{st_checks:7d} checks exact ({state_mm} mismatches) [{time.monotonic() - t_s:.2f}s]"
-        )
-        grand_mm += state_mm
+    state_done = full or "state" in selected
+    if state_done:
+        t1 = time.monotonic()
+        try:
+            st = validate_state_file(ev_dir / STATE_FILE, model)
+        except EvidenceError as e:
+            errors += 1
+            print(f"[ERROR] {STATE_FILE}: {e}", file=out)
+        else:
+            status = "PASS" if st.mismatches == 0 else "FAIL"
+            print(
+                f"[{status}] {'state_gfx1201':34s}: {st.elements - st.element_mm:,}/{st.elements:,} D elements, "
+                f"{st.preserved - st.preserved_mm:,}/{st.preserved:,} preserved words, "
+                f"{st.control - st.control_mm}/{st.control} MODE control values [{time.monotonic() - t1:.2f}s]",
+                file=out,
+            )
+            for d in st.details:
+                print(f"   {d}", file=out)
+            total.add(st)
 
+    n_inst = sum(1 for _, _, err, _ in results if err is None)
+    scope = "FULL" if full else f"PARTIAL ({len(jobs)} of {len(SPECS)} instructions{', state' if state_done else ''})"
     print(
-        f"\nValidated {len(results)}/{len(SPECS)} instructions, "
-        f"{grand_elems - grand_mm:,}/{grand_elems:,} elements bit-exact "
-        f"({grand_mm} mismatches) in {time.monotonic() - t0:.2f}s."
+        f"\n{scope}: {n_inst}/{len(jobs)} instruction files and {'the' if state_done else 'no'} state file checked; "
+        f"{total.elements - total.element_mm:,}/{total.elements:,} D elements bit-exact, "
+        f"{total.preserved - total.preserved_mm:,}/{total.preserved:,} preserved words, "
+        f"{total.control - total.control_mm}/{total.control} control values; "
+        f"{total.mismatches} mismatches, {errors} errors in {time.monotonic() - t0:.2f}s.",
+        file=out,
     )
-    return 0 if grand_mm == 0 else 1
+    if errors:
+        return 2
+    return 0 if total.mismatches == 0 else 1
 
 
 def main(argv: list[str] | None = None) -> int:
-    ap = argparse.ArgumentParser(description="Validate gfx1201 WMMA/SWMMAC model against frozen hardware evidence.")
-    ap.add_argument("--evidence", type=Path, default=None, help="Directory containing .mmbin files")
-    ap.add_argument("--variant", action="append", default=None, help="Specific instruction name(s) to validate")
+    ap = argparse.ArgumentParser(description="Validate the gfx1201 WMMA/SWMMAC model against frozen hardware evidence.")
+    ap.add_argument("--evidence", type=Path, default=None, help="Evidence directory (default: ./evidence of the checkout)")
+    ap.add_argument("--variant", action="append", default=None, help="Validate only this instruction ('state' for the state file); repeatable")
     ap.add_argument("--workers", type=int, default=None, help="Parallel worker processes (default: auto)")
+    ap.add_argument("--manifest-sha256", default=RELEASE_MANIFEST_SHA256, help="Trusted manifest SHA-256 (default: this release)")
     args = ap.parse_args(argv)
-    return validate(args.evidence, args.variant, args.workers)
+    return validate(args.evidence, args.variant, args.workers, args.manifest_sha256)
 
 
 if __name__ == "__main__":
