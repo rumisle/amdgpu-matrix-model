@@ -64,6 +64,7 @@ class WmmaSpec:
     a_dwords: int
     b_dwords: int
     cd_dwords: int
+    opcode: int  # VOP3P OP field (RDNA4 ISA section 15.3.7)
     has_index_key: bool = False
 
     @property
@@ -118,29 +119,29 @@ def elem_bits(fmt: str) -> int:
 
 _SPEC_LIST: tuple[WmmaSpec, ...] = (
     # Dense WMMA (11 instructions)
-    WmmaSpec("v_wmma_f32_16x16x16_f16", "f16", "f16", "f32", 16, False, 4, 4, 8),
-    WmmaSpec("v_wmma_f32_16x16x16_bf16", "bf16", "bf16", "f32", 16, False, 4, 4, 8),
-    WmmaSpec("v_wmma_f16_16x16x16_f16", "f16", "f16", "f16", 16, False, 4, 4, 4),
-    WmmaSpec("v_wmma_bf16_16x16x16_bf16", "bf16", "bf16", "bf16", 16, False, 4, 4, 4),
-    WmmaSpec("v_wmma_f32_16x16x16_fp8_fp8", "fp8", "fp8", "f32", 16, False, 2, 2, 8),
-    WmmaSpec("v_wmma_f32_16x16x16_fp8_bf8", "fp8", "bf8", "f32", 16, False, 2, 2, 8),
-    WmmaSpec("v_wmma_f32_16x16x16_bf8_fp8", "bf8", "fp8", "f32", 16, False, 2, 2, 8),
-    WmmaSpec("v_wmma_f32_16x16x16_bf8_bf8", "bf8", "bf8", "f32", 16, False, 2, 2, 8),
-    WmmaSpec("v_wmma_i32_16x16x16_iu8", "iu8", "iu8", "i32", 16, False, 2, 2, 8),
-    WmmaSpec("v_wmma_i32_16x16x16_iu4", "iu4", "iu4", "i32", 16, False, 1, 1, 8),
-    WmmaSpec("v_wmma_i32_16x16x32_iu4", "iu4", "iu4", "i32", 32, False, 2, 2, 8),
+    WmmaSpec("v_wmma_f32_16x16x16_f16", "f16", "f16", "f32", 16, False, 4, 4, 8, 64),
+    WmmaSpec("v_wmma_f32_16x16x16_bf16", "bf16", "bf16", "f32", 16, False, 4, 4, 8, 65),
+    WmmaSpec("v_wmma_f16_16x16x16_f16", "f16", "f16", "f16", 16, False, 4, 4, 4, 66),
+    WmmaSpec("v_wmma_bf16_16x16x16_bf16", "bf16", "bf16", "bf16", 16, False, 4, 4, 4, 67),
+    WmmaSpec("v_wmma_f32_16x16x16_fp8_fp8", "fp8", "fp8", "f32", 16, False, 2, 2, 8, 70),
+    WmmaSpec("v_wmma_f32_16x16x16_fp8_bf8", "fp8", "bf8", "f32", 16, False, 2, 2, 8, 71),
+    WmmaSpec("v_wmma_f32_16x16x16_bf8_fp8", "bf8", "fp8", "f32", 16, False, 2, 2, 8, 72),
+    WmmaSpec("v_wmma_f32_16x16x16_bf8_bf8", "bf8", "bf8", "f32", 16, False, 2, 2, 8, 73),
+    WmmaSpec("v_wmma_i32_16x16x16_iu8", "iu8", "iu8", "i32", 16, False, 2, 2, 8, 68),
+    WmmaSpec("v_wmma_i32_16x16x16_iu4", "iu4", "iu4", "i32", 16, False, 1, 1, 8, 69),
+    WmmaSpec("v_wmma_i32_16x16x32_iu4", "iu4", "iu4", "i32", 32, False, 2, 2, 8, 74),
     # Sparse SWMMAC (11 instructions)
-    WmmaSpec("v_swmmac_f32_16x16x32_f16", "f16", "f16", "f32", 32, True, 4, 8, 8, True),
-    WmmaSpec("v_swmmac_f32_16x16x32_bf16", "bf16", "bf16", "f32", 32, True, 4, 8, 8, True),
-    WmmaSpec("v_swmmac_f16_16x16x32_f16", "f16", "f16", "f16", 32, True, 4, 8, 4, True),
-    WmmaSpec("v_swmmac_bf16_16x16x32_bf16", "bf16", "bf16", "bf16", 32, True, 4, 8, 4, True),
-    WmmaSpec("v_swmmac_f32_16x16x32_fp8_fp8", "fp8", "fp8", "f32", 32, True, 2, 4, 8, True),
-    WmmaSpec("v_swmmac_f32_16x16x32_fp8_bf8", "fp8", "bf8", "f32", 32, True, 2, 4, 8, True),
-    WmmaSpec("v_swmmac_f32_16x16x32_bf8_fp8", "bf8", "fp8", "f32", 32, True, 2, 4, 8, True),
-    WmmaSpec("v_swmmac_f32_16x16x32_bf8_bf8", "bf8", "bf8", "f32", 32, True, 2, 4, 8, True),
-    WmmaSpec("v_swmmac_i32_16x16x32_iu8", "iu8", "iu8", "i32", 32, True, 2, 4, 8, True),
-    WmmaSpec("v_swmmac_i32_16x16x32_iu4", "iu4", "iu4", "i32", 32, True, 1, 2, 8, True),
-    WmmaSpec("v_swmmac_i32_16x16x64_iu4", "iu4", "iu4", "i32", 64, True, 2, 4, 8, False),
+    WmmaSpec("v_swmmac_f32_16x16x32_f16", "f16", "f16", "f32", 32, True, 4, 8, 8, 80, True),
+    WmmaSpec("v_swmmac_f32_16x16x32_bf16", "bf16", "bf16", "f32", 32, True, 4, 8, 8, 81, True),
+    WmmaSpec("v_swmmac_f16_16x16x32_f16", "f16", "f16", "f16", 32, True, 4, 8, 4, 82, True),
+    WmmaSpec("v_swmmac_bf16_16x16x32_bf16", "bf16", "bf16", "bf16", 32, True, 4, 8, 4, 83, True),
+    WmmaSpec("v_swmmac_f32_16x16x32_fp8_fp8", "fp8", "fp8", "f32", 32, True, 2, 4, 8, 87, True),
+    WmmaSpec("v_swmmac_f32_16x16x32_fp8_bf8", "fp8", "bf8", "f32", 32, True, 2, 4, 8, 88, True),
+    WmmaSpec("v_swmmac_f32_16x16x32_bf8_fp8", "bf8", "fp8", "f32", 32, True, 2, 4, 8, 89, True),
+    WmmaSpec("v_swmmac_f32_16x16x32_bf8_bf8", "bf8", "bf8", "f32", 32, True, 2, 4, 8, 90, True),
+    WmmaSpec("v_swmmac_i32_16x16x32_iu8", "iu8", "iu8", "i32", 32, True, 2, 4, 8, 84, True),
+    WmmaSpec("v_swmmac_i32_16x16x32_iu4", "iu4", "iu4", "i32", 32, True, 1, 2, 8, 85, True),
+    WmmaSpec("v_swmmac_i32_16x16x64_iu4", "iu4", "iu4", "i32", 64, True, 2, 4, 8, 86, False),
 )
 
 SPECS: dict[str, WmmaSpec] = {s.name: s for s in _SPEC_LIST}
