@@ -20,9 +20,15 @@ sys.path.insert(0, str(ROOT))
 
 from amdgpu_matrix_model.model import wmma_wave
 from amdgpu_matrix_model.specs import SPECS
-from tools.capture_evidence import gen_random_chunk
+from amdgpu_matrix_model.evidence import generate_chunk_inputs
 from tools.hw_run import run_jobs
-from tools.probe_asm import build_co
+from tools.probe_asm import build_co, kernel_name
+
+
+def gen_random_chunk(spec, n_waves: int, seed: int, gen: str):
+    a, b, c, idx = generate_chunk_inputs(spec, n_waves, seed, gen)
+    shape = lambda v, dw: np.array(v, dtype=np.uint32).reshape(n_waves, 32, dw)  # noqa: E731
+    return shape(a, spec.a_dwords), shape(b, spec.b_dwords), shape(c, spec.cd_dwords), (np.array(idx, dtype=np.uint32).reshape(n_waves, 32) if idx is not None else None)
 
 
 def _check_chunk(args: tuple) -> tuple[int, int]:
@@ -99,8 +105,7 @@ def main() -> None:
             for sa in (0, 1):
                 for sb in (0, 1):
                     for cl in (False, True):
-                        tag = "" if (sa == 0 and sb == 0 and not cl) else f"_s{sa}{sb}" + ("_clamp" if cl else "")
-                        kern = f"{spec.name}{tag}"
+                        kern = kernel_name(spec, 0, (sa, sb, 0), (0, 0, 0), cl)
                         a, b, c, _ = gen_random_chunk(spec, nw, seed, "clamp_stress" if cl else "raw")
                         seed += 1
                         jobs.append({"id": kern, "spec": spec.name, "kernel": kern, "a": a, "b": b, "c": c})
@@ -108,7 +113,7 @@ def main() -> None:
         elif spec.sparse and not spec.is_int:
             nw = max(1, args.waves_per_mode // 2)
             for ik in (0, 1):
-                kern = f"{spec.name}_ik1" if ik == 1 else spec.name
+                kern = kernel_name(spec, ik)
                 for mode in ("finite", "raw"):
                     a, b, c, idx = gen_random_chunk(spec, nw, seed, mode)
                     seed += 1
@@ -119,12 +124,10 @@ def main() -> None:
             keys = (0, 1) if spec.has_index_key else (0,)
             nw = max(1, args.waves_per_mode // (8 if spec.has_index_key else 4))
             for ik in keys:
-                ik_tag = "_ik1" if (spec.has_index_key and ik == 1) else ""
                 for sa in (0, 1):
                     for sb in (0, 1):
                         for cl in (False, True):
-                            stag = "" if (sa == 0 and sb == 0 and not cl) else f"_s{sa}{sb}" + ("_clamp" if cl else "")
-                            kern = f"{spec.name}{ik_tag}{stag}"
+                            kern = kernel_name(spec, ik, (sa, sb, 0), (0, 0, 0), cl)
                             a, b, c, idx = gen_random_chunk(spec, nw, seed, "clamp_stress" if cl else "raw")
                             seed += 1
                             jobs.append({"id": kern, "spec": spec.name, "kernel": kern, "a": a, "b": b, "c": c, "idx": idx})

@@ -13,7 +13,7 @@ sys.path.insert(0, str(ROOT))
 from amdgpu_matrix_model.specs import SPECS, WmmaSpec
 from tools.abi import wrap_kernels
 
-_LOG2_WAVE_BYTES = {1: 7, 2: 8, 4: 9, 8: 10}
+_LOG2_WAVE_BYTES = {1: 7, 2: 8, 4: 9, 8: 10, 16: 11}
 _LANE_OFF_VGPR = {1: "v1", 2: "v2", 4: "v3", 8: "v4"}
 
 
@@ -57,12 +57,13 @@ def _emit_ptr_add(slo: int, dwords: int) -> list[str]:
 def kernel_body(spec: WmmaSpec, modifiers: str = "") -> str:
     """Emit one batched wave32 probe kernel.
 
-    kernarg layout (40 bytes):
+    kernarg layout (48 bytes; see tools/hw_run.py):
       0x00: a_ptr   (u64)  [G, 32, a_dwords] u32
       0x08: b_ptr   (u64)  [G, 32, b_dwords] u32
       0x10: c_ptr   (u64)  [G, 32, cd_dwords] u32
       0x18: d_ptr   (u64)  [G, 32, cd_dwords] u32
       0x20: idx_ptr (u64)  [G, 32, 1] u32 (SWMMAC only)
+      0x28: param_ptr (u64) [G] u32 (unused here)
     """
     lines = [
         "\ts_load_b256 s[4:11], s[0:1], 0x0",
@@ -112,57 +113,79 @@ def kernel_body(spec: WmmaSpec, modifiers: str = "") -> str:
     return "\n".join(lines) + "\n"
 
 
+def kernel_name(
+    spec: WmmaSpec,
+    index_key: int = 0,
+    neg_lo: tuple[int, ...] = (0, 0, 0),
+    neg_hi: tuple[int, ...] = (0, 0, 0),
+    clamp: bool = False,
+) -> str:
+    """Canonical probe-kernel symbol for one instruction and modifier set."""
+    name = spec.name + ("_ik1" if index_key else "")
+    if any(neg_lo):
+        name += "_lo" + "".join(map(str, neg_lo))
+    if any(neg_hi):
+        name += "_hi" + "".join(map(str, neg_hi))
+    return name + ("_clamp" if clamp else "")
+
+
+def modifier_text(
+    index_key: int = 0,
+    neg_lo: tuple[int, ...] = (0, 0, 0),
+    neg_hi: tuple[int, ...] = (0, 0, 0),
+    clamp: bool = False,
+) -> str:
+    mods = ["index_key:1"] if index_key else []
+    if any(neg_lo):
+        mods.append("neg_lo:[{},{},{}]".format(*neg_lo))
+    if any(neg_hi):
+        mods.append("neg_hi:[{},{},{}]".format(*neg_hi))
+    if clamp:
+        mods.append("clamp")
+    return " ".join(mods)
+
+
+# Float A/B modifier sets probed on f16/bf16 forms (dense and sparse) and C sets on dense forms.
+AB_MODS = (
+    ((1, 0, 0), (1, 0, 0)),
+    ((1, 0, 0), (0, 0, 0)),
+    ((0, 0, 0), (0, 1, 0)),
+)
+SPARSE_AB_MODS = (
+    ((1, 0, 0), (0, 0, 0)),
+    ((0, 0, 0), (1, 0, 0)),
+    ((0, 1, 0), (0, 0, 0)),
+    ((0, 0, 0), (0, 1, 0)),
+    ((1, 1, 0), (0, 1, 0)),
+)
+C_MODS = (((0, 0, 1), (0, 0, 0)), ((0, 0, 0), (0, 0, 1)), ((0, 0, 1), (0, 0, 1)))
+
+
+def variant_fields(spec: WmmaSpec) -> list[tuple[int, tuple[int, ...], tuple[int, ...], bool]]:
+    """All (index_key, neg_lo, neg_hi, clamp) field sets that have a probe kernel for `spec`."""
+    keys = (0, 1) if spec.has_index_key else (0,)
+    out = []
+    for ik in keys:
+        out.append((ik, (0, 0, 0), (0, 0, 0), False))
+        if spec.is_int:
+            for sa in (0, 1):
+                for sb in (0, 1):
+                    for cl in (False, True):
+                        if sa or sb or cl:
+                            out.append((ik, (sa, sb, 0), (0, 0, 0), cl))
+        elif not spec.sparse:
+            mods = (AB_MODS if not spec.is_fp8_family else ()) + C_MODS
+            out.extend((ik, lo, hi, False) for lo, hi in mods)
+        elif not spec.is_fp8_family:
+            out.extend((ik, lo, hi, False) for lo, hi in SPARSE_AB_MODS)
+    return out
+
+
 def variant_kernels() -> list[tuple[str, WmmaSpec, str]]:
     """All (symbol, spec, modifiers) probe kernels to assemble."""
-    out: list[tuple[str, WmmaSpec, str]] = []
-    for spec in SPECS.values():
-        if not spec.sparse:
-            out.append((spec.name, spec, ""))
-            if spec.is_int:
-                for sa in (0, 1):
-                    for sb in (0, 1):
-                        for cl in (False, True):
-                            if sa == 0 and sb == 0 and not cl:
-                                continue
-                            mods = []
-                            if sa or sb:
-                                mods.append(f"neg_lo:[{sa},{sb},0]")
-                            if cl:
-                                mods.append("clamp")
-                            tag = f"_s{sa}{sb}" + ("_clamp" if cl else "")
-                            out.append((f"{spec.name}{tag}", spec, " ".join(mods)))
-            elif spec.a_fmt in ("f16", "bf16"):
-                # Sample neg_lo / neg_hi modifiers on A, B, C
-                out.append((f"{spec.name}_neg_a", spec, "neg_lo:[1,0,0] neg_hi:[1,0,0]"))
-                out.append((f"{spec.name}_neg_lo_a", spec, "neg_lo:[1,0,0]"))
-                out.append((f"{spec.name}_neg_hi_b", spec, "neg_hi:[0,1,0]"))
-                out.append((f"{spec.name}_neg_c", spec, "neg_lo:[0,0,1]"))
-                out.append((f"{spec.name}_abs_c", spec, "neg_hi:[0,0,1]"))
-                out.append((f"{spec.name}_negabs_c", spec, "neg_lo:[0,0,1] neg_hi:[0,0,1]"))
-            else:
-                # fp8 / bf8 C modifiers
-                out.append((f"{spec.name}_neg_c", spec, "neg_lo:[0,0,1]"))
-                out.append((f"{spec.name}_abs_c", spec, "neg_hi:[0,0,1]"))
-        else:
-            keys = (0, 1) if spec.has_index_key else (None,)
-            for ik in keys:
-                ik_mod = [f"index_key:{ik}"] if ik == 1 else []
-                ik_tag = f"_ik{ik}" if ik == 1 else ""
-                out.append((f"{spec.name}{ik_tag}", spec, " ".join(ik_mod)))
-                if spec.is_int:
-                    for sa in (0, 1):
-                        for sb in (0, 1):
-                            for cl in (False, True):
-                                if sa == 0 and sb == 0 and not cl:
-                                    continue
-                                mods = list(ik_mod)
-                                if sa or sb:
-                                    mods.append(f"neg_lo:[{sa},{sb},0]")
-                                if cl:
-                                    mods.append("clamp")
-                                tag = f"{ik_tag}_s{sa}{sb}" + ("_clamp" if cl else "")
-                                out.append((f"{spec.name}{tag}", spec, " ".join(mods)))
-    return out
+    return [
+        (kernel_name(spec, *f), spec, modifier_text(*f)) for spec in SPECS.values() for f in variant_fields(spec)
+    ]
 
 
 def build_co(out_path: Path | None = None) -> Path:
@@ -170,7 +193,7 @@ def build_co(out_path: Path | None = None) -> Path:
     out_path = out_path or (ROOT / "build" / "probes_gfx1201.co")
     out_path.parent.mkdir(parents=True, exist_ok=True)
     kernels = [(sym, kernel_body(spec, mods)) for sym, spec, mods in variant_kernels()]
-    asm = wrap_kernels(kernels, kernarg=40, vgprs=40, sgprs=24)
+    asm = wrap_kernels(kernels, kernarg=48, vgprs=40, sgprs=24)
 
     with tempfile.TemporaryDirectory() as tmp:
         s_path = Path(tmp) / "probes.s"

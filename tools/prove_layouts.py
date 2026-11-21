@@ -19,7 +19,7 @@ sys.path.insert(0, str(ROOT))
 from amdgpu_matrix_model.layout import pack_a, pack_b, pack_cd, pack_idx, unpack_cd
 from amdgpu_matrix_model.specs import SPECS, WmmaSpec
 from tools.hw_run import run_jobs
-from tools.probe_asm import build_co
+from tools.probe_asm import build_co, kernel_name
 
 # Valid 2:4 index pairs (idx0 < idx1)
 _VALID_PAIRS = ((0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3))
@@ -123,7 +123,7 @@ def build_dense_layout_job(spec: WmmaSpec) -> tuple[dict, list[list[list[int]]]]
 def build_sparse_layout_job(spec: WmmaSpec, index_key: int = 0) -> tuple[dict, list[list[list[int]]]]:
     """Build waves that prove A (compressed), B (dense), C/D, and row-distinct index_set layout."""
     a_waves, b_waves, c_waves, idx_waves, expected = [], [], [], [], []
-    kernel = f"{spec.name}_ik{index_key}" if (spec.has_index_key and index_key == 1) else spec.name
+    kernel = kernel_name(spec, index_key)
 
     # Row-distinct valid 2:4 index table (16 x k_a)
     n_groups = spec.k // 4

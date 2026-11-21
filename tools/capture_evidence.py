@@ -1,20 +1,23 @@
 """Capture and freeze compact binary hardware evidence (AMDMAT02) for all 22 gfx1201 instructions.
 
-Random chunks store only their SplitMix64 seed, generator mode, and hardware output D words.
-Hand-built adversarial chunks store explicit A, B, C inputs plus hardware output D words.
+`plan()` is the complete corpus definition. Random chunks store only their SplitMix64 seed, generator
+and the hardware D words; explicit chunks store their A, B, C (, IDX) inputs too.
+
+    capture_evidence.py            capture every planned chunk and rewrite all files
+    capture_evidence.py --update   keep every stored chunk whose header (and explicit inputs) still
+                                   match the plan, capture only new or changed chunks, and rewrite
+                                   only the files that change
+
+The manifest records, per chunk, the capture session and the SHA-256 of its inputs.
 """
 
 from __future__ import annotations
 
 import argparse
-import array
-import hashlib
 import json
-import platform
-import struct
 import sys
 import time
-from datetime import date
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -22,37 +25,78 @@ import numpy as np
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from amdgpu_matrix_model.layout import pack_a, pack_b, pack_cd
-from amdgpu_matrix_model.specs import SPECS, WmmaSpec
-from amdgpu_matrix_model.validation import generate_chunk_inputs, validate, write_evidence_file
-from tools.hw_run import run_jobs
-from tools.probe_asm import build_co
+from amdgpu_matrix_model.evidence import (  # noqa: E402
+    MANIFEST_FORMAT,
+    STATE_FILE,
+    TARGET,
+    Chunk,
+    generate_chunk_inputs,
+    inputs_sha256,
+    iter_chunk_data,
+    read_manifest,
+    read_matrix_file,
+    sha256_file,
+    write_matrix_file,
+)
+from amdgpu_matrix_model.layout import pack_a, pack_b, pack_cd  # noqa: E402
+from amdgpu_matrix_model.specs import SPECS, WmmaSpec  # noqa: E402
+from tools import cases  # noqa: E402
+from tools.cases import bf16_bits as _bf16_bits  # noqa: E402
+from tools.cases import f16_bits as _f16_bits  # noqa: E402
+from tools.cases import f32_bits as _f32_bits  # noqa: E402
+from tools.probe_asm import AB_MODS, C_MODS, SPARSE_AB_MODS, build_co, kernel_name  # noqa: E402
+
+EVIDENCE = ROOT / "evidence"
 
 
-def _f32_bits(x: float) -> int:
-    return struct.unpack("<I", struct.pack("<f", x))[0]
+@dataclass(eq=False)
+class Planned:
+    spec: str
+    chunk: Chunk
+    a: np.ndarray
+    b: np.ndarray
+    c: np.ndarray
+    idx: np.ndarray | None
+    kernel: str
+    d: np.ndarray | None = None
+    session: str | None = None
+
+    def flat_inputs(self) -> tuple[list[int], list[int], list[int], list[int] | None]:
+        f = lambda x: np.asarray(x, dtype=np.uint32).reshape(-1).tolist()  # noqa: E731
+        return f(self.a), f(self.b), f(self.c), (f(self.idx) if self.idx is not None else None)
 
 
-def _f16_bits(x: float) -> int:
-    return int(np.float16(x).view(np.uint16))
+def _random(spec: WmmaSpec, chunk: Chunk) -> Planned:
+    a, b, c, idx = generate_chunk_inputs(spec, chunk.waves, chunk.seed, chunk.gen)
+    w = chunk.waves
+    arr = lambda v, dw: np.array(v, dtype=np.uint32).reshape(w, 32, dw)  # noqa: E731
+    return Planned(
+        spec.name,
+        chunk,
+        arr(a, spec.a_dwords),
+        arr(b, spec.b_dwords),
+        arr(c, spec.cd_dwords),
+        np.array(idx, dtype=np.uint32).reshape(w, 32) if idx is not None else None,
+        kernel_name(spec, chunk.index_key, chunk.neg_lo, chunk.neg_hi, chunk.clamp),
+    )
 
 
-def _bf16_bits(x: float) -> int:
-    return _f32_bits(x) >> 16
+def _explicit(spec: WmmaSpec, tag: str, packed, index_key: int = 0, neg_lo=(0, 0, 0), neg_hi=(0, 0, 0)) -> Planned:
+    a, b, c, idx = packed
+    chunk = Chunk(tag, "explicit", len(a), None, index_key, tuple(neg_lo), tuple(neg_hi), False)
+    return Planned(spec.name, chunk, a, b, c, idx, kernel_name(spec, index_key, chunk.neg_lo, chunk.neg_hi, False))
+
+
+def _pack_diag_cases(spec: WmmaSpec, case_list: list[tuple[list[int], list[int], int]]):
+    return cases.pack_cases(spec, [(a, b, None, c) for a, b, c in case_list])
 
 
 def _enc_fp8_pow2(exp: int, neg: bool = False) -> int:
-    s = 0x80 if neg else 0
-    if exp >= -6:
-        return s | ((exp + 7) << 3)
-    return s | {-7: 4, -8: 2, -9: 1}[exp]
+    return cases.pow2("fp8", exp, neg)
 
 
 def _enc_bf8_pow2(exp: int, neg: bool = False) -> int:
-    s = 0x80 if neg else 0
-    if exp >= -14:
-        return s | ((exp + 15) << 2)
-    return s | {-15: 2, -16: 1}[exp]
+    return cases.pow2("bf8", exp, neg)
 
 
 def _split_pow2_8(prod_exp: int, fa: str, fb: str, neg: bool = False) -> tuple[int, int]:
@@ -69,40 +113,14 @@ def _split_pow2_8(prod_exp: int, fa: str, fb: str, neg: bool = False) -> tuple[i
     return a_b, b_b
 
 
-def _pack_diag_cases(spec: WmmaSpec, cases: list[tuple[list[int], list[int], int]]) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    a_w, b_w, c_w = [], [], []
-    for at in range(0, len(cases), 16):
-        chunk = cases[at : at + 16]
-        am = [[0] * spec.k_a for _ in range(16)]
-        bm = [[0] * 16 for _ in range(spec.k_b)]
-        cm = [[0] * 16 for _ in range(16)]
-        for t, (av, bv, cv) in enumerate(chunk):
-            am[t] = av
-            for k in range(spec.k_b):
-                bm[k][t] = bv[k]
-            cm[t][t] = cv
-        a_w.append(pack_a(spec, am))
-        b_w.append(pack_b(spec, bm))
-        c_w.append(pack_cd(spec, cm))
-    return (
-        np.array(a_w, dtype=np.uint32).reshape(-1, 32, spec.a_dwords),
-        np.array(b_w, dtype=np.uint32).reshape(-1, 32, spec.b_dwords),
-        np.array(c_w, dtype=np.uint32).reshape(-1, 32, spec.cd_dwords),
-    )
+def gen_adversarial_dense_float(spec: WmmaSpec):
+    """The original hand-built special-value and alignment cases (first capture, unchanged inputs).
 
-
-def gen_random_chunk(spec: WmmaSpec, n_waves: int, seed: int, gen: str) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray | None]:
-    a_l, b_l, c_l, idx_l = generate_chunk_inputs(spec, n_waves, seed, gen)
-    a = np.array(a_l, dtype=np.uint32).reshape(n_waves, 32, spec.a_dwords)
-    b = np.array(b_l, dtype=np.uint32).reshape(n_waves, 32, spec.b_dwords)
-    c = np.array(c_l, dtype=np.uint32).reshape(n_waves, 32, spec.cd_dwords)
-    idx = np.array(idx_l, dtype=np.uint32).reshape(n_waves, 32) if idx_l is not None else None
-    return a, b, c, idx
-
-
-def gen_adversarial_dense_float(spec: WmmaSpec) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Targeted adversarial edge cases covering every discovered arithmetic subtlety."""
-    cases: list[tuple[list[int], list[int], int]] = []
+    Slot positions are logical K labels (RDNA4 ISA layout). The loops over (0, 8, 4, 12) visit the
+    first slot of steps 0, 2, 1, 3 and the triples below place their three products in three different
+    steps; both orders are kept from the first capture so that the stored inputs stay bit-identical.
+    """
+    case_list: list[tuple[list[int], list[int], int]] = []
 
     if spec.is_fp8_family:
         af, bf = spec.a_fmt, spec.b_fmt
@@ -111,13 +129,13 @@ def gen_adversarial_dense_float(spec: WmmaSpec) -> tuple[np.ndarray, np.ndarray,
         a_inf = 0x7C if af == "bf8" else None
         b_inf = 0x7C if bf == "bf8" else None
 
-        cases.append(([0x80] * 16, [0x00] * 16, 0x8000_0000))
-        cases.append(([0x00] * 16, [0x00] * 16, 0x8000_0000))
+        case_list.append(([0x80] * 16, [0x00] * 16, 0x8000_0000))
+        case_list.append(([0x00] * 16, [0x00] * 16, 0x8000_0000))
         for pos in (0, 4, 8, 12):
             av, bv = [0] * 16, [0] * 16
             av[pos], bv[pos] = a1, b1
             av[pos + 1], bv[pos + 1] = a1 ^ 0x80, b1
-            cases.append((av, bv, 0x8000_0000))
+            case_list.append((av, bv, 0x8000_0000))
         max_e = (8 if af == "fp8" else 15) + (8 if bf == "fp8" else 15)
         min_e = (-9 if af == "fp8" else -16) + (-9 if bf == "fp8" else -16)
         pa, pb = _split_pow2_8(min(max_e, 16), af, bf, False)
@@ -127,24 +145,24 @@ def gen_adversarial_dense_float(spec: WmmaSpec) -> tuple[np.ndarray, np.ndarray,
             av[0], bv[0] = pa, pb
             av[p1], bv[p1] = sa, sb
             av[p2], bv[p2] = sa, sb
-            cases.append((av, bv, 0))
-            cases.append((av, bv, _f32_bits(-(2.0 ** (min(max_e, 16) - 27)))))
+            case_list.append((av, bv, 0))
+            case_list.append((av, bv, _f32_bits(-(2.0 ** (min(max_e, 16) - 27)))))
         for cv in (0, 0x7F80_0000, 0xFF80_0000, 0x7F80_0123, 0xFFC0_1234):
             for pos in (0, 7, 8, 15):
                 av, bv = [0] * 16, [0] * 16
                 av[pos], bv[pos] = 0x7F, b1
-                cases.append((av, bv, cv))
+                case_list.append((av, bv, cv))
                 if a_inf is not None:
                     av, bv = [0] * 16, [0] * 16
                     av[pos], bv[pos] = a_inf, 0
-                    cases.append((av, bv, cv))
+                    case_list.append((av, bv, cv))
                 if a_inf is not None and b_inf is not None:
                     av, bv = [0] * 16, [0] * 16
                     av[pos], bv[pos] = a_inf, b_inf
-                    cases.append((av, bv, cv))
+                    case_list.append((av, bv, cv))
                     av2, bv2 = [0] * 16, [0] * 16
                     av2[pos], bv2[pos] = a_inf | 0x80, b_inf
-                    cases.append((av2, bv2, cv))
+                    case_list.append((av2, bv2, cv))
     else:
         is_bf16 = spec.a_fmt == "bf16"
         enc = _bf16_bits if is_bf16 else _f16_bits
@@ -156,9 +174,9 @@ def gen_adversarial_dense_float(spec: WmmaSpec) -> tuple[np.ndarray, np.ndarray,
         c_snan = 0x7F80_0123 if spec.d_fmt == "f32" else (0x7F85 if spec.d_fmt == "bf16" else 0x7C05)
         c_ninf = 0xFF80_0000 if spec.d_fmt == "f32" else (0xFF80 if spec.d_fmt == "bf16" else 0xFC00)
 
-        cases.append(([0x8000] * 16, [0x0000] * 16, c_nzero))
-        cases.append(([0x0000] * 16, [0x0000] * 16, c_nzero))
-        for pos in (0, 4, 8, 12):
+        case_list.append(([0x8000] * 16, [0x0000] * 16, c_nzero))
+        case_list.append(([0x0000] * 16, [0x0000] * 16, c_nzero))
+        for pos in (0, 8, 4, 12):
             for av_v, bv_v, cv in [
                 (pinf, pinf, 0),
                 (pinf, ninf, 0),
@@ -171,238 +189,259 @@ def gen_adversarial_dense_float(spec: WmmaSpec) -> tuple[np.ndarray, np.ndarray,
             ]:
                 av, bv = [0] * 16, [0] * 16
                 av[pos], bv[pos] = av_v, bv_v
-                cases.append((av, bv, cv))
+                case_list.append((av, bv, cv))
         if spec.d_fmt == "f16":
-            cases.append(([_f16_bits(2**-11), _f16_bits(-(2**-13))] + [0] * 14, [one, _f16_bits(2**-12)] + [0] * 14, 0x3C01))
-            cases.append(([_f16_bits(2**-11), _f16_bits(2**-13)] + [0] * 14, [one, _f16_bits(2**-12)] + [0] * 14, 0x3C00))
-            cases.append(([_f16_bits(32768.0), _f16_bits(32752.0), _f16_bits(-(2**-9))] + [0] * 13, [one, one, one] + [0] * 13, 0))
+            case_list.append(([_f16_bits(2**-11), _f16_bits(-(2**-13))] + [0] * 14, [one, _f16_bits(2**-12)] + [0] * 14, 0x3C01))
+            case_list.append(([_f16_bits(2**-11), _f16_bits(2**-13)] + [0] * 14, [one, _f16_bits(2**-12)] + [0] * 14, 0x3C00))
+            case_list.append(([_f16_bits(32768.0), _f16_bits(32752.0), _f16_bits(-(2**-9))] + [0] * 13, [one, one, one] + [0] * 13, 0))
             for t in (39, 40, 41, 42):
                 ea = -(t // 2)
                 eb = -t - ea
-                cases.append(([_f16_bits(2**-12), _f16_bits(2.0**ea)] + [0] * 14, [_f16_bits(2**-13), _f16_bits(2.0**eb)] + [0] * 14, 0))
+                case_list.append(([_f16_bits(2**-12), _f16_bits(2.0**ea)] + [0] * 14, [_f16_bits(2**-13), _f16_bits(2.0**eb)] + [0] * 14, 0))
         elif spec.d_fmt == "bf16":
-            cases.append(([_bf16_bits(-(2**-13))] + [0] * 15, [_bf16_bits(2**-12)] + [0] * 15, 0x3F81))
-            cases.append(([_bf16_bits(-(2**-12))] + [0] * 15, [_bf16_bits(2**-12)] + [0] * 15, 0x3F81))
-            cases.append(([_bf16_bits(-(2**-12))] + [0] * 15, [_bf16_bits(2**-11)] + [0] * 15, 0x3F81))
-            cases.append(([_bf16_bits(2**-13)] + [0] * 15, [_bf16_bits(2**-12)] + [0] * 15, 0xBF81))
+            case_list.append(([_bf16_bits(-(2**-13))] + [0] * 15, [_bf16_bits(2**-12)] + [0] * 15, 0x3F81))
+            case_list.append(([_bf16_bits(-(2**-12))] + [0] * 15, [_bf16_bits(2**-12)] + [0] * 15, 0x3F81))
+            case_list.append(([_bf16_bits(-(2**-12))] + [0] * 15, [_bf16_bits(2**-11)] + [0] * 15, 0x3F81))
+            case_list.append(([_bf16_bits(2**-13)] + [0] * 15, [_bf16_bits(2**-12)] + [0] * 15, 0xBF81))
         else:
             big_e = 60 if is_bf16 else 14
-            for i, j, l in ((0, 8, 4), (0, 4, 8), (8, 4, 12), (4, 12, 0), (0, 1, 2), (0, 2, 1)):
+            for i, j, l in ((0, 4, 8), (0, 8, 4), (4, 8, 12), (8, 12, 0), (0, 1, 2), (0, 2, 1)):
                 av, bv = [0] * 16, [0] * 16
                 av[i], bv[i] = enc(2.0**big_e), enc(2.0**big_e)
                 av[j], bv[j] = enc(-(2.0**big_e)), enc(2.0**big_e)
                 av[l], bv[l] = one, one
-                cases.append((av, bv, 0))
+                case_list.append((av, bv, 0))
 
-    return _pack_diag_cases(spec, cases)
+    return _pack_diag_cases(spec, case_list)
 
 
-def _detect_hardware() -> dict[str, str]:
-    hip_ver = "unknown"
-    ver_h = Path("/opt/rocm/include/hip/hip_version.h")
-    if ver_h.is_file():
-        vals = {}
-        for line in ver_h.read_text().splitlines():
-            parts = line.split()
-            if len(parts) >= 3 and parts[0] == "#define" and parts[1].startswith("HIP_VERSION_"):
-                vals[parts[1]] = parts[2]
-        if all(k in vals for k in ("HIP_VERSION_MAJOR", "HIP_VERSION_MINOR", "HIP_VERSION_PATCH")):
-            hip_ver = f"{vals['HIP_VERSION_MAJOR']}.{vals['HIP_VERSION_MINOR']}.{vals['HIP_VERSION_PATCH']}"
-    return {
-        "gpu": "AMD Radeon RX 9070 XT",
-        "gfx_target": "gfx1201",
-        "hip_version": hip_ver,
-        "kernel_driver": platform.release(),
-        "capture_date": date.today().isoformat(),
+def _first_capture(spec: WmmaSpec, seed: int) -> tuple[list[Planned], int]:
+    """Chunks of the first capture, with the same seed sequence."""
+    out: list[Planned] = []
+    if not spec.sparse and not spec.is_int:
+        for gen in ("finite", "raw"):
+            out.append(_random(spec, Chunk(gen, gen, 200, seed)))
+            seed += 1
+        out.append(_explicit(spec, "adv", gen_adversarial_dense_float(spec)))
+        if spec.is_fp8_family:
+            mods = [("neg_c", *C_MODS[0]), ("abs_c", *C_MODS[1])]
+        else:
+            tags = ("neg_a", "neg_lo_a", "neg_hi_b")
+            mods = [(t, *m) for t, m in zip(tags, AB_MODS)]
+            mods += [(t, *m) for t, m in zip(("neg_c", "abs_c", "negabs_c"), C_MODS)]
+        for tag, lo, hi in mods:
+            out.append(_random(spec, Chunk(tag, "raw", 8, seed, 0, lo, hi)))
+        seed += 1
+    elif not spec.sparse:
+        for sa in (0, 1):
+            for sb in (0, 1):
+                for cl in (False, True):
+                    tag = f"s{sa}{sb}" + ("_clamp" if cl else "")
+                    out.append(_random(spec, Chunk(tag, "clamp_stress" if cl else "raw", 50, seed, 0, (sa, sb, 0), (0, 0, 0), cl)))
+                    seed += 1
+    elif not spec.is_int:
+        for ik in (0, 1):
+            for gen in ("finite", "raw"):
+                out.append(_random(spec, Chunk(f"ik{ik}_{gen}", gen, 100, seed, ik)))
+                seed += 1
+    else:
+        keys = (0, 1) if spec.has_index_key else (0,)
+        nw = 25 if spec.has_index_key else 50
+        for ik in keys:
+            for sa in (0, 1):
+                for sb in (0, 1):
+                    for cl in (False, True):
+                        tag = f"ik{ik}_s{sa}{sb}" + ("_clamp" if cl else "")
+                        gen = "clamp_stress" if cl else "raw"
+                        out.append(_random(spec, Chunk(tag, gen, nw, seed, ik, (sa, sb, 0), (0, 0, 0), cl)))
+                        seed += 1
+    return out, seed
+
+
+def _targeted(spec: WmmaSpec, seed: int) -> tuple[list[Planned], int]:
+    """Second capture: step order, cancellation, tiny accumulators, signed zeros, sparse modifiers."""
+    out: list[Planned] = []
+    if spec.is_int or spec.is_fp8_family:
+        return out, seed
+    out.append(_explicit(spec, "k_order", cases.pack_cases(spec, cases.k_order_cases(spec))))
+    out.append(_explicit(spec, "cancel", cases.pack_cases(spec, cases.cancel_cases(spec))))
+    out.append(_explicit(spec, "tiny_acc", cases.pack_cases(spec, cases.tiny_acc_cases(spec))))
+    out.append(_explicit(spec, "signed_zero", cases.pack_cases(spec, cases.signed_zero_cases(spec))))
+    if spec.sparse:
+        witness = cases.modifier_witness_cases(spec)
+        for ik in (0, 1):
+            for lo, hi in (((0, 0, 0), (0, 0, 0)),) + SPARSE_AB_MODS:
+                mtag = "".join(map(str, lo)) + "_" + "".join(map(str, hi))
+                packed = cases.pack_cases(spec, witness, index_key=ik, junk_other_half=True)
+                out.append(_explicit(spec, f"ik{ik}_mod_witness_{mtag}", packed, ik, lo, hi))
+                if any(lo) or any(hi):
+                    out.append(_random(spec, Chunk(f"ik{ik}_mod_{mtag}", "finite", 8, seed, ik, lo, hi)))
+                    seed += 1
+    return out, seed
+
+
+def plan() -> dict[str, list[Planned]]:
+    """The complete corpus: per instruction, the first-capture chunks followed by the targeted ones."""
+    out: dict[str, list[Planned]] = {}
+    seed = 202601
+    for spec in SPECS.values():
+        out[spec.name], seed = _first_capture(spec, seed)
+    seed = 303001
+    for spec in SPECS.values():
+        more, seed = _targeted(spec, seed)
+        out[spec.name] += more
+    return out
+
+
+def _old_sessions(manifest_path: Path) -> tuple[list[dict], dict[tuple[str, str], str]]:
+    """Capture sessions and per-chunk (and state file) session ids from an existing manifest (format 1 or 2)."""
+    if not manifest_path.is_file():
+        return [], {}
+    m = read_manifest(manifest_path)
+    if m.get("format") == MANIFEST_FORMAT:
+        by_chunk = {(f["file"], ch["tag"]): ch["session"] for f in m["files"] if f["kind"] == "matrix" for ch in f["chunks"]}
+        by_chunk.update({(f["file"], f["sha256"]): f["session"] for f in m["files"] if f["kind"] == "state"})
+        return m["sessions"], by_chunk
+    # Format 1 (first release): one session, chunk list implied by the files.
+    hw = m["hardware"]
+    sess = {
+        "id": hw["capture_date"],
+        "date": hw["capture_date"],
+        "hardware": {"device_name": hw["gpu"], "isa": hw["gfx_target"], "hip_version": hw["hip_version"]},
+        "code_object_sha256": None,
+        "tool_revision": None,
+        "note": "first capture; code objects and capture logs were not retained",
     }
+    return [sess], {}
 
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="Capture frozen gfx1201 hardware evidence for all 22 instructions.")
     ap.add_argument("--co", type=Path, default=None, help="Pre-assembled probes_gfx1201.co (default: assemble locally)")
+    ap.add_argument("--update", action="store_true", help="Reuse stored chunks that still match the plan")
+    ap.add_argument("--dry-run", action="store_true", help="Only report what would be captured")
     args = ap.parse_args()
-    co = args.co if args.co is not None else build_co()
-    ev_dir = ROOT / "evidence"
-    ev_dir.mkdir(parents=True, exist_ok=True)
 
-    spec_chunks: dict[str, list[dict]] = {}
-    all_jobs: list[dict] = []
-    seed = 202601
+    planned = plan()
+    sessions, old_chunk_session = _old_sessions(EVIDENCE / "manifest.json")
+    default_old = sessions[0]["id"] if sessions else None
+    todo: list[Planned] = []
+    changed: set[str] = set()
+    for name, chunks in planned.items():
+        path = EVIDENCE / f"{name}.mmbin"
+        stored: dict[str, tuple] = {}
+        if args.update and path.is_file():
+            mf = read_matrix_file(path, name)
+            stored = {ch.tag: (ch, a, b, c, idx, d) for ch, a, b, c, idx, d in iter_chunk_data(mf)}
+        kept = 0
+        for p in chunks:
+            hit = stored.get(p.chunk.tag)
+            if hit is not None and hit[0] == p.chunk and inputs_sha256(*hit[1:5]) == inputs_sha256(*p.flat_inputs()):
+                p.d = np.array(hit[5], dtype=np.uint32)
+                p.session = old_chunk_session.get((path.name, p.chunk.tag), default_old)
+                kept += 1
+            else:
+                todo.append(p)
+        if kept != len(chunks) or set(stored) - {p.chunk.tag for p in chunks}:
+            changed.add(name)
+        print(f"  {name:34s}: {kept:3d} stored chunks kept, {len(chunks) - kept:3d} to capture")
+    waves = sum(p.chunk.waves for p in todo)
+    print(f"{len(todo)} chunks ({waves} waves) to capture; {len(changed)} files change")
+    if args.dry_run:
+        return
+    if todo:
+        from tools.hw_run import capture_session, run_jobs
 
-    for spec in SPECS.values():
-        chunks = []
-        if not spec.sparse and not spec.is_int:
-            for gen in ("finite", "raw"):
-                a, b, c, _ = gen_random_chunk(spec, 200, seed, gen)
-                jid = f"{spec.name}__{gen}"
-                chunks.append({"tag": gen, "gen": gen, "seed": seed, "waves": 200, "jid": jid})
-                all_jobs.append({"id": jid, "spec": spec.name, "a": a, "b": b, "c": c})
-                seed += 1
-            a_adv, b_adv, c_adv = gen_adversarial_dense_float(spec)
-            jid = f"{spec.name}__adv"
-            chunks.append(
-                {"tag": "adv", "gen": "explicit", "waves": len(a_adv), "jid": jid, "a": a_adv, "b": b_adv, "c": c_adv}
-            )
-            all_jobs.append({"id": jid, "spec": spec.name, "a": a_adv, "b": b_adv, "c": c_adv})
+        co = args.co if args.co is not None else build_co()
+        session = capture_session(co, "matrix")
+        sessions = [s for s in sessions if s["id"] != session["id"]] + [session]
+        jobs = []
+        for i, p in enumerate(todo):
+            job = {"id": f"j{i}", "spec": p.spec, "kernel": p.kernel, "a": p.a, "b": p.b, "c": p.c}
+            if p.idx is not None:
+                job["idx"] = p.idx
+            jobs.append(job)
+        t0 = time.monotonic()
+        res = run_jobs(jobs, co_path=co)
+        print(f"Hardware capture finished in {time.monotonic() - t0:.2f}s.")
+        for i, p in enumerate(todo):
+            p.d = res[f"j{i}"]
+            p.session = session["id"]
 
-            mod_list = (
-                [("neg_c", (0, 0, 1), (0, 0, 0)), ("abs_c", (0, 0, 0), (0, 0, 1))]
-                if spec.is_fp8_family
-                else [
-                    ("neg_a", (1, 0, 0), (1, 0, 0)),
-                    ("neg_lo_a", (1, 0, 0), (0, 0, 0)),
-                    ("neg_hi_b", (0, 0, 0), (0, 1, 0)),
-                    ("neg_c", (0, 0, 1), (0, 0, 0)),
-                    ("abs_c", (0, 0, 0), (0, 0, 1)),
-                    ("negabs_c", (0, 0, 1), (0, 0, 1)),
-                ]
-            )
-            a_m, b_m, c_m, _ = gen_random_chunk(spec, 8, seed, "raw")
-            m_seed = seed
-            seed += 1
-            for mtag, nlo, nhi in mod_list:
-                jid = f"{spec.name}__{mtag}"
-                chunks.append(
-                    {
-                        "tag": mtag,
-                        "gen": "raw",
-                        "seed": m_seed,
-                        "waves": 8,
-                        "neg_lo": list(nlo),
-                        "neg_hi": list(nhi),
-                        "jid": jid,
-                    }
-                )
-                all_jobs.append({"id": jid, "spec": spec.name, "kernel": f"{spec.name}_{mtag}", "a": a_m, "b": b_m, "c": c_m})
-
-        elif not spec.sparse and spec.is_int:
-            for sa in (0, 1):
-                for sb in (0, 1):
-                    for cl in (False, True):
-                        tag = f"s{sa}{sb}" + ("_clamp" if cl else "")
-                        kern = spec.name if (sa == 0 and sb == 0 and not cl) else f"{spec.name}_{tag}"
-                        gen = "clamp_stress" if cl else "raw"
-                        a, b, c, _ = gen_random_chunk(spec, 50, seed, gen)
-                        jid = f"{spec.name}__{tag}"
-                        chunks.append(
-                            {
-                                "tag": tag,
-                                "gen": gen,
-                                "seed": seed,
-                                "waves": 50,
-                                "neg_lo": [sa, sb, 0],
-                                "clamp": cl,
-                                "jid": jid,
-                            }
-                        )
-                        all_jobs.append({"id": jid, "spec": spec.name, "kernel": kern, "a": a, "b": b, "c": c})
-                        seed += 1
-
-        elif spec.sparse and not spec.is_int:
-            for ik in (0, 1):
-                ik_tag = "_ik1" if ik == 1 else ""
-                kern = f"{spec.name}{ik_tag}"
-                for gen in ("finite", "raw"):
-                    a, b, c, idx = gen_random_chunk(spec, 100, seed, gen)
-                    tag = f"ik{ik}_{gen}"
-                    jid = f"{spec.name}__{tag}"
-                    chunks.append({"tag": tag, "gen": gen, "seed": seed, "waves": 100, "index_key": ik, "jid": jid})
-                    all_jobs.append({"id": jid, "spec": spec.name, "kernel": kern, "a": a, "b": b, "c": c, "idx": idx})
-                    seed += 1
-
-        else:
-            keys = (0, 1) if spec.has_index_key else (0,)
-            nw = 25 if spec.has_index_key else 50
-            for ik in keys:
-                ik_tag = "_ik1" if (spec.has_index_key and ik == 1) else ""
-                for sa in (0, 1):
-                    for sb in (0, 1):
-                        for cl in (False, True):
-                            stag = "" if (sa == 0 and sb == 0 and not cl) else f"_s{sa}{sb}" + ("_clamp" if cl else "")
-                            kern = f"{spec.name}{ik_tag}{stag}"
-                            tag = f"ik{ik}_s{sa}{sb}" + ("_clamp" if cl else "")
-                            gen = "clamp_stress" if cl else "raw"
-                            a, b, c, idx = gen_random_chunk(spec, nw, seed, gen)
-                            jid = f"{spec.name}__{tag}"
-                            chunks.append(
-                                {
-                                    "tag": tag,
-                                    "gen": gen,
-                                    "seed": seed,
-                                    "waves": nw,
-                                    "index_key": ik,
-                                    "neg_lo": [sa, sb, 0],
-                                    "clamp": cl,
-                                    "jid": jid,
-                                }
-                            )
-                            all_jobs.append({"id": jid, "spec": spec.name, "kernel": kern, "a": a, "b": b, "c": c, "idx": idx})
-                            seed += 1
-
-        spec_chunks[spec.name] = chunks
-
-    print(f"Capturing {len(all_jobs)} GPU jobs across all {len(SPECS)} instructions...")
-    t0 = time.monotonic()
-    hw_res = run_jobs(all_jobs, co_path=co)
-    print(f"Hardware capture finished in {time.monotonic() - t0:.2f}s.")
-
-    manifest = {"target": "gfx1201", "hardware": _detect_hardware(), "variants": []}
-    total_bytes = 0
-    total_elems = 0
-    for spec in SPECS.values():
-        hdr_chunks = []
-        words = array.array("I")
-        v_elems = 0
-        for ch in spec_chunks[spec.name]:
-            d_hw = hw_res[ch["jid"]]
-            v_elems += ch["waves"] * 256
-            hdr_entry: dict = {"tag": ch["tag"], "gen": ch["gen"], "waves": ch["waves"]}
-            if ch["gen"] != "explicit":
-                hdr_entry["seed"] = ch["seed"]
-            if ch.get("index_key", 0):
-                hdr_entry["index_key"] = ch["index_key"]
-            if any(ch.get("neg_lo", (0, 0, 0))):
-                hdr_entry["neg_lo"] = ch["neg_lo"]
-            if any(ch.get("neg_hi", (0, 0, 0))):
-                hdr_entry["neg_hi"] = ch["neg_hi"]
-            if ch.get("clamp", False):
-                hdr_entry["clamp"] = True
-            hdr_chunks.append(hdr_entry)
-
-            if ch["gen"] == "explicit":
-                words.extend(np.asarray(ch["a"], dtype=np.uint32).reshape(-1).tolist())
-                words.extend(np.asarray(ch["b"], dtype=np.uint32).reshape(-1).tolist())
-                words.extend(np.asarray(ch["c"], dtype=np.uint32).reshape(-1).tolist())
-                if spec.sparse:
-                    words.extend(np.asarray(ch["idx"], dtype=np.uint32).reshape(-1).tolist())
-            words.extend(np.asarray(d_hw, dtype=np.uint32).reshape(-1).tolist())
-
-        out_path = ev_dir / f"{spec.name}.mmbin"
-        write_evidence_file(out_path, {"target": "gfx1201", "spec": spec.name, "chunks": hdr_chunks}, words)
-        sz = out_path.stat().st_size
-        sha = hashlib.sha256(out_path.read_bytes()).hexdigest()
-        total_bytes += sz
-        total_elems += v_elems
-        manifest["variants"].append(
+    files = []
+    for name, chunks in planned.items():
+        spec = SPECS[name]
+        path = EVIDENCE / f"{name}.mmbin"
+        if name in changed or not args.update:
+            words: list[int] = []
+            for p in chunks:
+                a, b, c, idx = p.flat_inputs()
+                if p.chunk.gen == "explicit":
+                    words += a + b + c + (idx or [])
+                words += np.asarray(p.d, dtype=np.uint32).reshape(-1).tolist()
+            write_matrix_file(path, spec, [p.chunk for p in chunks], words)
+        mf = read_matrix_file(path, name)
+        assert [c.tag for c in mf.chunks] == [p.chunk.tag for p in chunks]
+        files.append(
             {
-                "spec": spec.name,
-                "file": out_path.name,
-                "elements": v_elems,
-                "waves": v_elems // 256,
-                "bytes": sz,
-                "sha256": sha,
+                "file": path.name,
+                "kind": "matrix",
+                "spec": name,
+                "bytes": path.stat().st_size,
+                "sha256": sha256_file(path),
+                "waves": sum(c.waves for c in mf.chunks),
+                "elements": 256 * sum(c.waves for c in mf.chunks),
+                "chunks": [
+                    {"tag": p.chunk.tag, "waves": p.chunk.waves, "inputs_sha256": inputs_sha256(*p.flat_inputs()), "session": p.session}
+                    for p in chunks
+                ],
             }
         )
-        print(f"  wrote {out_path.name:38s}: {v_elems:7d} elems, {sz / 1024:7.1f} KiB")
+    write_manifest(files, sessions, old_chunk_session)
 
-    manifest["total_elements"] = total_elems
-    manifest["total_bytes"] = total_bytes
-    (ev_dir / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
-    print(f"Total frozen evidence: {total_elems:,} elements, {total_bytes / (1024 * 1024):.2f} MiB")
 
-    rc = validate(ev_dir)
-    if rc != 0:
-        sys.exit(rc)
+def write_manifest(matrix_files: list[dict], sessions: list[dict], old: dict) -> None:
+    """Write evidence/manifest.json from the matrix entries and the current state file.
+
+    The state file's session comes from build/state_session.json (written by probe_state.py) when its
+    SHA-256 matches, otherwise from the previous manifest entry for the same file content.
+    """
+    from amdgpu_matrix_model.validation import state_summary
+
+    state_path = EVIDENCE / STATE_FILE
+    st = state_summary(state_path)
+    sha = sha256_file(state_path)
+    side = ROOT / "build" / "state_session.json"
+    sess = json.loads(side.read_text()) if side.is_file() else None
+    if sess is not None and sess.pop("file_sha256") == sha:
+        sessions = [s for s in sessions if s["id"] != sess["id"]] + [sess]
+        state_session = sess["id"]
+    elif (STATE_FILE, sha) in old:
+        state_session = old[(STATE_FILE, sha)]
+    else:
+        raise SystemExit("state file has no known capture session (run tools/probe_state.py --capture)")
+    used = {c["session"] for f in matrix_files for c in f["chunks"]} | {state_session}
+    sessions = [s for s in sessions if s["id"] in used]
+    files = matrix_files + [
+        {"file": STATE_FILE, "kind": "state", "bytes": state_path.stat().st_size, "sha256": sha, "session": state_session, **st}
+    ]
+    manifest = {
+        "format": MANIFEST_FORMAT,
+        "target": TARGET,
+        "sessions": sessions,
+        "files": files,
+        "totals": {
+            "matrix_files": len(matrix_files),
+            "matrix_waves": sum(f["waves"] for f in matrix_files),
+            "matrix_elements": sum(f["elements"] for f in matrix_files),
+            "state_records": st["records"],
+            "state_checks": st["checks"],
+            "bytes": sum(f["bytes"] for f in files),
+        },
+    }
+    path = EVIDENCE / "manifest.json"
+    path.write_text(json.dumps(manifest, indent=1) + "\n")
+    print(f"Wrote {path} (sha256 {sha256_file(path)})")
 
 
 if __name__ == "__main__":

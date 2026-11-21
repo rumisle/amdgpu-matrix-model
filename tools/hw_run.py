@@ -6,7 +6,10 @@ Requires ROCm HIP (`libamdhip64.so`) and `numpy` on the machine with the gfx1201
 from __future__ import annotations
 
 import ctypes as C
+import hashlib
 import os
+import subprocess
+from datetime import date
 from pathlib import Path
 
 import numpy as np
@@ -78,6 +81,36 @@ class Hip:
         self._ok(self.lib.hipDeviceSynchronize(), "hipDeviceSynchronize")
 
 
+def device_identity(device: int | None = None) -> dict[str, str]:
+    """GPU name and HIP runtime version as reported by HIP.
+
+    The ISA is not queried separately: the probe code objects are built for gfx1201 only, and
+    hipModuleLoadData rejects them on any other target.
+    """
+    dev_idx = int(os.environ.get("HIP_DEVICE", "0")) if device is None else device
+    hip = Hip(dev_idx)
+    buf = C.create_string_buffer(256)
+    hip._ok(hip.lib.hipDeviceGetName(buf, C.c_int(256), C.c_int(dev_idx)), "hipDeviceGetName")
+    rt = C.c_int()
+    hip._ok(hip.lib.hipRuntimeGetVersion(C.byref(rt)), "hipRuntimeGetVersion")
+    return {"device_name": buf.value.decode(errors="replace"), "isa": "gfx1201", "hip_runtime_version": str(rt.value)}
+
+
+def capture_session(co_path: Path, kind: str) -> dict:
+    """Provenance of one capture run: date, device, code object SHA-256, tool revision."""
+    root = Path(__file__).resolve().parent.parent
+    rev = subprocess.run(["git", "-C", str(root), "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+    dirty = subprocess.run(["git", "-C", str(root), "status", "--porcelain", "--", "amdgpu_matrix_model", "tools"], capture_output=True, text=True).stdout
+    today = date.today().isoformat()
+    return {
+        "id": f"{today}-{kind}",
+        "date": today,
+        "hardware": device_identity(),
+        "code_object_sha256": hashlib.sha256(Path(co_path).read_bytes()).hexdigest(),
+        "tool_revision": (rev or "unknown") + ("+modified" if dirty.strip() else ""),
+    }
+
+
 def run_jobs(jobs: list[dict], co_path: Path, device: int | None = None) -> dict[str, np.ndarray]:
     """Run a batch of WMMA/SWMMAC probe jobs on the local gfx1201 GPU.
 
@@ -86,7 +119,10 @@ def run_jobs(jobs: list[dict], co_path: Path, device: int | None = None) -> dict
       spec: str (key in SPECS)
       kernel: str (optional, defaults to spec)
       a, b, c: uint32 arrays of shape (G, 32, dwords) or flat
-      idx: uint32 array of shape (G, 32) or flat (required for sparse or mode/exec probes)
+      idx: uint32 array of shape (G, 32) or flat (required for sparse forms)
+      param: optional uint32 array of shape (G,): one scalar per wave (MODE or EXEC value for state probes)
+
+    Kernel arguments (48 bytes): a, b, c, d, idx, param device pointers (u64 each).
     """
     dev_idx = int(os.environ.get("HIP_DEVICE", "0")) if device is None else device
     hip = Hip(dev_idx)
@@ -110,25 +146,34 @@ def run_jobs(jobs: list[dict], co_path: Path, device: int | None = None) -> dict
         if idx is not None:
             assert idx.size == grid * 32, f"{jid}: idx size mismatch"
 
+        param = job.get("param")
+        param = np.ascontiguousarray(param, dtype=np.uint32).reshape(-1) if param is not None else None
+        if param is not None:
+            assert param.size == grid, f"{jid}: param size mismatch"
+        d_shape = job.get("d_dwords", spec.cd_dwords)
+
         da = hip.malloc(a.nbytes)
         db = hip.malloc(b.nbytes)
         dc = hip.malloc(c.nbytes)
-        dd = hip.malloc(c.nbytes)
+        dd = hip.malloc(grid * 32 * d_shape * 4)
         didx = hip.malloc(idx.nbytes) if idx is not None else 0
+        dpar = hip.malloc(param.nbytes) if param is not None else 0
         try:
             hip.h2d(da, a)
             hip.h2d(db, b)
             hip.h2d(dc, c)
             if idx is not None:
                 hip.h2d(didx, idx)
+            if param is not None:
+                hip.h2d(dpar, param)
 
-            args = b"".join(p.to_bytes(8, "little") for p in (da, db, dc, dd, didx))
+            args = b"".join(p.to_bytes(8, "little") for p in (da, db, dc, dd, didx, dpar))
             hip.launch(hip.get_fn(kernel), grid, 32, args)
             hip.sync()
 
-            d_out = np.empty_like(c)
+            d_out = np.empty(grid * 32 * d_shape, dtype=np.uint32)
             hip.d2h(d_out, dd)
-            results[jid] = d_out.reshape(grid, 32, spec.cd_dwords)
+            results[jid] = d_out.reshape(grid, 32, d_shape)
         finally:
             hip.free(da)
             hip.free(db)
@@ -136,5 +181,7 @@ def run_jobs(jobs: list[dict], co_path: Path, device: int | None = None) -> dict
             hip.free(dd)
             if didx:
                 hip.free(didx)
+            if dpar:
+                hip.free(dpar)
 
     return results

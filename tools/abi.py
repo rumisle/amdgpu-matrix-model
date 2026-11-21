@@ -73,7 +73,7 @@ _META_TAIL = """\
 
 def wrap_kernels(
     kernels: list[tuple[str, str]],
-    kernarg: int = 40,
+    kernarg: int = 48,
     vgprs: int = 40,
     sgprs: int = 24,
 ) -> str:
