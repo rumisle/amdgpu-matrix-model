@@ -234,7 +234,7 @@ def parse_chunk(spec: WmmaSpec, raw) -> Chunk:
     if not is_u(waves, 32) or not 1 <= waves <= MAX_WAVES:
         raise EvidenceError(f"{tag}: waves must be an integer in 1..{MAX_WAVES}")
     seed = raw.get("seed")
-    if (gen == "explicit") != (seed is None) or (seed is not None and not is_u(seed, 64)):
+    if (gen == "explicit") == ("seed" in raw) or ("seed" in raw and not is_u(seed, 64)):
         raise EvidenceError(f"{tag}: random chunks need a u64 seed, explicit chunks none")
     ik = raw.get("index_key", 0)
     if "index_key" in raw and (ik != 1 or type(ik) is not int or not spec.has_index_key):

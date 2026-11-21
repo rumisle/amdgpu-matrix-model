@@ -5,7 +5,7 @@ arguments and raise ``ValueError`` for anything outside the domain documented in
 
 `_shift_rne`, `pack_float`, `_align_floor`, `_acc_drops_tiny_negative` and `dot_float_step` adapt
 AMD rocjitsu's gfx12_dot.h / dot_packed16.h (MIT, Copyright (c) 2025-2026 Advanced Micro Devices, Inc.);
-see THIRD_PARTY_NOTICES.md.
+see THIRD_PARTY_NOTICES.md (also installed with the license files).
 """
 
 from __future__ import annotations
@@ -241,9 +241,19 @@ def _subgroup(spec: WmmaSpec) -> int:
     return 32 // spec.a_bits
 
 
+def _select(b_vec: Sequence[int], idx_vec: Sequence[int]) -> list[int]:
+    return [b_vec[4 * (ka // 2) + idx_vec[ka]] for ka in range(len(idx_vec))]
+
+
 def select_sparse_b(b_vec: Sequence[int], idx_vec: Sequence[int]) -> list[int]:
-    """Select K/2 active B elements from dense B (length K) using 2-bit per-element indices."""
-    return [b_vec[4 * (ka // 2) + (idx_vec[ka] & 0x3)] for ka in range(len(idx_vec))]
+    """Select the K/2 B elements used by compressed A: b_sel[ka] = b_vec[4 * (ka // 2) + idx_vec[ka]].
+
+    `idx_vec` has an even length n with entries 0..3, `b_vec` length 2n (raw elements, not checked).
+    """
+    n = len(idx_vec)
+    if n % 2 or len(b_vec) != 2 * n or any(type(i) is not int or not 0 <= i <= 3 for i in idx_vec):
+        raise ValueError("select_sparse_b needs an even number of indices 0..3 and twice as many B elements")
+    return _select(b_vec, idx_vec)
 
 
 def _spec(spec_name: str) -> WmmaSpec:
@@ -292,7 +302,7 @@ def _dot(
     clamp: bool,
 ) -> int:
     """One logical D[row, col] from checked operands."""
-    b_eff: Sequence[int] = select_sparse_b(b_vec, idx_vec) if spec.sparse else b_vec  # type: ignore[arg-type]
+    b_eff: Sequence[int] = _select(b_vec, idx_vec) if spec.sparse else b_vec  # type: ignore[arg-type]
     steps = step_schedule(spec)
 
     if spec.is_int:
@@ -461,7 +471,7 @@ def wmma_wave(
             raise ValueError(f"{spec_name} requires idx_words")
         idx_mat = unpack_idx(spec, idx_words, index_key=index_key)
     else:
-        if idx_words is not None or index_key != 0:
+        if idx_words is not None or type(index_key) is not int or index_key != 0:
             raise ValueError(f"{spec_name} takes no idx_words or index_key")
         idx_mat = None
     return pack_cd(spec, _matrix(spec, a_mat, b_mat, c_mat, idx_mat, lo, hi, clamp))

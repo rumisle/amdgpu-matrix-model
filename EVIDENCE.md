@@ -30,7 +30,7 @@ All integers are little-endian. JSON objects never repeat a key.
 
 `files` lists exactly the 22 instruction files in `SPECS` order (`amdgpu_matrix_model/specs.py`), then the state file; the directory holds no other `.mmbin`/`.mmstate` file. A matrix entry's `chunks` equal the file header's chunks in order; `inputs_sha256` is the SHA-256 of the chunk's input words `A || B || C || IDX` (IDX only for SWMMAC) as u32 little-endian, regenerated for random chunks, stored for explicit ones; `elements = 256 * waves`. `session` names the capture run; the first session (2026-11-20) predates code-object and log retention, later sessions record the SHA-256 of the code object run and the tool commit. Input hashes of first-session chunks were computed when manifest 2 was written, from the same generator code the capture used; they pin the generator from then on, but no hash was recorded at that capture.
 
-The validator trusts a manifest only by its SHA-256, which is pinned in `amdgpu_matrix_model/validation.py` (`RELEASE_MANIFEST_SHA256`); the manifest then pins every file. Hashes establish identity with this release, not authenticity against someone who can also replace the validator.
+No other field is allowed; `kind` is `matrix` or `state`, hashes are 64 lowercase hex digits, and every count and total must equal what the files give (the state entry's `records` and `checks` as defined at the end of this document). The validator trusts a manifest only by its SHA-256, which is pinned in `amdgpu_matrix_model/validation.py` (`RELEASE_MANIFEST_SHA256`); the manifest then pins every file. Hashes establish identity with this release, not authenticity against someone who can also replace the validator.
 
 ## `.mmbin` (`AMDMAT02`)
 
@@ -48,7 +48,7 @@ Header: exactly `{"target": "gfx1201", "spec": <instruction>, "chunks": [...]}`,
 | `tag` | string `[a-z0-9_]{1,64}` | unique in the file |
 | `gen` | `"explicit"`, `"raw"`, `"finite"` (float forms only), `"clamp_stress"` (integer forms only) | required |
 | `waves` | integer | `1 <= waves <= 4096` |
-| `seed` | integer `0 <= seed < 2^64` | present exactly when `gen != "explicit"` |
+| `seed` | integer `0 <= seed < 2^64` | key present exactly when `gen != "explicit"` (`null` is not allowed) |
 | `index_key` | `1` | only on K=32 SWMMAC; omitted when 0 |
 | `neg_lo`, `neg_hi` | three 0/1 integers, not all 0 | omitted when all 0; legal per MODEL.md section 5 |
 | `clamp` | `true` | omitted when false |

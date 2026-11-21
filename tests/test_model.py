@@ -9,6 +9,7 @@ from amdgpu_matrix_model import (
     f32_to_bits,
     pack_a,
     pack_b,
+    select_sparse_b,
     slot_order,
     step_schedule,
     unpack_a,
@@ -108,6 +109,14 @@ class Arguments(unittest.TestCase):
             wmma_wave("v_wmma_i32_16x16x16_iu8", [0] * 64, [0] * 64, [0] * 256, op_sel=1)
         with self.assertRaises(ValueError):
             wmma_wave("v_wmma_f32_16x16x16_f16", [0] * 128, [0] * 128, [0] * 256, mode=0x10000)
+
+    def test_select_sparse_b(self):
+        self.assertEqual(select_sparse_b([10, 20, 30, 40], [1, 3]), [20, 40])
+        for b, idx in (([10, 20, 30, 40], [4, 0]), ([10, 20, 30, 40], [1]), ([10, 20, 30], [0, 1]), ([10, 20, 30, 40], [True, 0])):
+            with self.assertRaises(ValueError):
+                select_sparse_b(b, idx)
+        with self.assertRaises(ValueError):
+            wmma_wave("v_wmma_f32_16x16x16_f16", [0] * 128, [0] * 128, [0] * 256, index_key=False)
 
     def test_matrix_shape(self):
         with self.assertRaises(ValueError):

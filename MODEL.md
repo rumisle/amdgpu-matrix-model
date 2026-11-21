@@ -144,17 +144,17 @@ The model takes these fields (`clamp`, `op_sel`, `op_sel_hi`, `mode`, `exec_lo`)
 
 ## 9. Public API
 
-All functions take and return raw bit patterns as Python `int`s and raise `ValueError` for anything outside this domain:
+All functions take and return raw bit patterns as Python `int`s (not `bool` or `float`). The checked entry points (`wmma_wave`, `wmma_dot`, `wmma_matrix`, the `pack_*`/`unpack_*` layout functions, `slot_order`, `check_modifiers`, `select_sparse_b`) raise `ValueError` for anything outside the domain below; the low-level helpers listed as unchecked do not check:
 
 - `wmma_wave(spec_name, a_words, b_words, c_words, *, idx_words=None, index_key=0, neg_lo=(0,0,0), neg_hi=(0,0,0), clamp=False, op_sel=0, op_sel_hi=7, mode=0x00F0, exec_lo=0xFFFFFFFF) -> list[int]`: exactly `32 * a_dwords`, `32 * b_dwords`, `32 * cd_dwords` u32 words (lane-major), and 32 index words for SWMMAC (none otherwise). Returns `32 * cd_dwords` D words.
 - `wmma_dot(spec_name, a_vec, b_vec, c_word, *, idx_vec=None, neg_lo, neg_hi, clamp) -> int`: one D element from `k_a` A elements, `k_b` B elements, one C element, and for SWMMAC `k_a` index entries `0..3`.
 - `wmma_matrix(spec_name, a, b, c, *, idx=None, neg_lo, neg_hi, clamp) -> list[list[int]]`: `16 x k_a` A, `k_b x 16` B, `16 x 16` C, `16 x k_a` index table.
 - Layout: `pack_a/unpack_a`, `pack_b/unpack_b`, `pack_cd/unpack_cd` (logical matrices of raw elements <-> lane-major words), `pack_idx/unpack_idx(spec, ..., index_key=0)`, `slot_order(spec, "a"|"b")`.
-- Rules: `step_schedule(spec)`, `check_modifiers(spec, neg_lo, neg_hi, clamp)`, `select_sparse_b(b_vec, idx_vec)`.
+- Rules: `step_schedule(spec)`, `check_modifiers(spec, neg_lo, neg_hi, clamp)`, `select_sparse_b(b_vec, idx_vec)` (an even number of indices `0..3`, twice as many B elements).
 - Low-level helpers, unchecked: `decode_float(bits, fmt)`, `decode_int(bits, width, signed)`, `pack_float(units, grid, fmt)`, `dot_float_step(...)` (one step of section 3.2).
 - Tables: `SPECS`, `FLOAT_FORMATS`, `INT_FORMATS`, `WmmaSpec`, `FloatFormat`, `IntFormat`; boundary helpers `f32_to_bits`, `bits_to_f32`.
 
-Domain: element values `0 <= v < 2^bits`; modifiers are three 0/1 integers; `index_key` is 0 or 1 on K=32 SWMMAC and 0 elsewhere; `op_sel`/`op_sel_hi` are 3-bit and must keep their defaults on integer and sparse forms; `mode` is 16-bit, `exec_lo` 32-bit. Rejected modifier fields are listed in section 5.
+Domain: element values `0 <= v < 2^bits`, register words `0 <= w < 2^32`; modifiers are three 0/1 integers; `index_key` is the integer 0 or 1 on K=32 SWMMAC and 0 elsewhere; `op_sel`/`op_sel_hi` are 3-bit and must keep their defaults on integer and sparse forms; `mode` is 16-bit, `exec_lo` 32-bit. Rejected modifier fields are listed in section 5.
 
 ## 10. What Each Rule Rests On
 

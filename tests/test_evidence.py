@@ -206,6 +206,38 @@ class Spoofs(unittest.TestCase):
             self.assertEqual(rc, 2, text)
             self.assertIn("words, hardware has", text)
 
+    def test_prediction_word_domain(self):
+        """Words equal modulo 2^32, floats and bools that compare equal are malformed predictions."""
+        for change in (lambda w: w + (1 << 32), lambda w: w - (1 << 32), float, lambda w: bool(w) if w in (0, 1) else float(w)):
+            def bad(*a, change=change, **k):
+                return [change(w) for w in M.wmma_wave(*a, **k)]
+
+            for variant in ("v_wmma_f16_16x16x16_f16", "state"):
+                rc, text = run(self.ev, [variant], model=bad)
+                self.assertEqual(rc, 2, text)
+                self.assertIn("not a u32 int", text)
+
+    def test_manifest_counts_kinds_and_seed(self):
+        m = self.manifest()
+        for k in ("matrix_waves", "state_records", "state_checks"):
+            m["totals"][k] = 0
+        self.assertRejected("totals do not add up", self.save_manifest(m))
+        m = self.manifest()
+        m["files"][-1]["records"] = m["files"][-1]["checks"] = 0
+        m["totals"]["state_records"] = m["totals"]["state_checks"] = 0
+        self.assertRejected("records/checks differ", self.save_manifest(m), ["state"])
+        m = self.manifest()
+        m["files"][-1]["kind"] = "not-state"
+        self.assertRejected("kind or fields outside the schema", self.save_manifest(m), ["state"])
+        shutil.copy(EVIDENCE / "manifest.json", self.ev / "manifest.json")
+
+        def edit(h, p):
+            next(c for c in h["chunks"] if c["gen"] == "explicit")["seed"] = None
+            return h, p
+
+        sha = self.rewrite_header("v_wmma_f16_16x16x16_f16.mmbin", edit)
+        self.assertRejected("explicit chunks none", sha, ["v_wmma_f16_16x16x16_f16"])
+
     def test_input_hash_binds_regeneration(self):
         """A generator that flips the sign of every float A/B word would pass on outputs alone."""
         import amdgpu_matrix_model.evidence as E

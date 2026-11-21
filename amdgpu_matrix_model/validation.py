@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import sys
 import time
 from collections.abc import Callable
@@ -86,16 +87,21 @@ class Tally:
 
 
 def compare_d(spec: WmmaSpec, hw: list[int], pred: list[int], tally: Tally, where: str) -> None:
-    """Compare one wave's D words element by element; lengths must match exactly."""
+    """Compare one wave's D words element by element.
+
+    The prediction must be a list of exactly len(hw) raw u32 words: Python ints in 0..2**32-1
+    (bool, float and out-of-range values are errors, whether or not they compare equal).
+    """
     if type(pred) is not list or len(pred) != len(hw):
         raise EvidenceError(f"{where}: model returned {len(pred) if hasattr(pred, '__len__') else pred!r} words, hardware has {len(hw)}")
+    for i, p in enumerate(pred):
+        if not is_u(p, 32):
+            raise EvidenceError(f"{where}: model word {i} is {p!r}, not a u32 int")
     per = 32 // spec.d_bits
     mask = (1 << spec.d_bits) - 1
     tally.elements += per * len(hw)
     for i, (h, p) in enumerate(zip(hw, pred)):
         if h != p:
-            if type(p) is not int:
-                raise EvidenceError(f"{where}: model word {p!r} is not an int")
             n = sum(((h >> (s * spec.d_bits)) & mask) != ((p >> (s * spec.d_bits)) & mask) for s in range(per))
             tally.element_mm += n
             tally.note(f"{where} word {i}: hw={h:#010x} model={p:#010x}")
@@ -305,18 +311,62 @@ def default_evidence_dir() -> Path:
     return here.parent / "evidence"
 
 
+_SESSION_KEYS = {"id", "date", "hardware", "code_object_sha256", "tool_revision"}
+_MATRIX_ENTRY = {"file", "kind", "spec", "bytes", "sha256", "waves", "elements", "chunks"}
+_STATE_ENTRY = {"file", "kind", "bytes", "sha256", "session", "records", "checks"}
+_TOTALS = {"matrix_files", "matrix_waves", "matrix_elements", "state_records", "state_checks", "bytes"}
+_HEX64 = re.compile(r"[0-9a-f]{64}")
+
+
+def check_manifest_schema(m) -> None:
+    """Every manifest field, type and kind (EVIDENCE.md); counts are checked by check_inventory."""
+    if not isinstance(m, dict) or set(m) != {"format", "target", "sessions", "files", "totals"}:
+        raise EvidenceError("manifest.json: top-level fields differ from EVIDENCE.md")
+    if m["format"] != MANIFEST_FORMAT or m["target"] != TARGET:
+        raise EvidenceError("manifest.json: unsupported format or target")
+    if not isinstance(m["sessions"], list) or not m["sessions"]:
+        raise EvidenceError("manifest.json: sessions must be a non-empty list")
+    for s in m["sessions"]:
+        if not isinstance(s, dict) or not _SESSION_KEYS <= set(s) <= _SESSION_KEYS | {"note"} or not isinstance(s["id"], str):
+            raise EvidenceError("manifest.json: malformed session")
+    if len({s["id"] for s in m["sessions"]}) != len(m["sessions"]):
+        raise EvidenceError("manifest.json: duplicate session id")
+    if not isinstance(m["files"], list):
+        raise EvidenceError("manifest.json: files must be a list")
+    for f in m["files"]:
+        kind = f.get("kind") if isinstance(f, dict) else None
+        keys = {"matrix": _MATRIX_ENTRY, "state": _STATE_ENTRY}.get(kind)
+        if keys is None or set(f) != keys:
+            raise EvidenceError(f"manifest.json: entry {f.get('file') if isinstance(f, dict) else f!r} has kind or fields outside the schema")
+        if not isinstance(f["sha256"], str) or not _HEX64.fullmatch(f["sha256"]):
+            raise EvidenceError(f"{f['file']}: manifest sha256 is not 64 lowercase hex digits")
+        counts = ("bytes", "waves", "elements") if kind == "matrix" else ("bytes", "records", "checks")
+        if not all(is_u(f[k], 63) for k in counts):
+            raise EvidenceError(f"{f['file']}: manifest counts must be non-negative integers")
+        if kind == "matrix":
+            if not isinstance(f["chunks"], list) or not f["chunks"]:
+                raise EvidenceError(f"{f['file']}: manifest chunks must be a non-empty list")
+            for c in f["chunks"]:
+                if not isinstance(c, dict) or set(c) != {"tag", "waves", "inputs_sha256", "session"} or not is_u(c["waves"], 32):
+                    raise EvidenceError(f"{f['file']}: malformed manifest chunk")
+                if not isinstance(c["inputs_sha256"], str) or not _HEX64.fullmatch(c["inputs_sha256"]):
+                    raise EvidenceError(f"{f['file']}: manifest inputs_sha256 is not 64 lowercase hex digits")
+    t = m["totals"]
+    if not isinstance(t, dict) or set(t) != _TOTALS or not all(is_u(v, 63) for v in t.values()):
+        raise EvidenceError("manifest.json: totals fields differ from EVIDENCE.md")
+
+
 def check_inventory(ev_dir: Path, manifest_sha256: str) -> dict:
-    """Pinned manifest, exact file inventory, sizes and hashes; return the manifest."""
+    """Pinned manifest, full manifest schema, exact file inventory, sizes, hashes and every count."""
     mpath = ev_dir / "manifest.json"
     if not mpath.is_file():
         raise EvidenceError(f"{mpath} not found")
     if sha256_file(mpath) != manifest_sha256:
         raise EvidenceError(f"manifest.json SHA-256 {sha256_file(mpath)} is not the trusted {manifest_sha256}")
     m = read_manifest(mpath)
-    if set(m) != {"format", "target", "sessions", "files", "totals"} or m["format"] != MANIFEST_FORMAT or m["target"] != TARGET:
-        raise EvidenceError("manifest.json: unsupported format or target")
-    names = [f.get("file") for f in m["files"]]
-    if names != expected_files():
+    check_manifest_schema(m)
+    names = [f["file"] for f in m["files"]]
+    if names != expected_files() or [f["kind"] for f in m["files"]] != ["matrix"] * len(SPECS) + ["state"]:
         raise EvidenceError("manifest.json does not list exactly the release inventory")
     present = sorted(p.name for p in ev_dir.iterdir() if p.suffix in (".mmbin", ".mmstate"))
     if present != sorted(names):
@@ -331,11 +381,21 @@ def check_inventory(ev_dir: Path, manifest_sha256: str) -> dict:
                 raise EvidenceError(f"{f['file']}: manifest entry names another instruction or session")
             if f["elements"] != 256 * f["waves"] or f["waves"] != sum(c["waves"] for c in f["chunks"]):
                 raise EvidenceError(f"{f['file']}: manifest counts are inconsistent")
-        elif f["session"] not in sessions:
-            raise EvidenceError(f"{f['file']}: manifest entry names an unknown session")
-    mats = [f for f in m["files"] if f["kind"] == "matrix"]
-    t = m["totals"]
-    if (t["matrix_files"], t["matrix_elements"], t["bytes"]) != (len(mats), sum(f["elements"] for f in mats), sum(f["bytes"] for f in m["files"])):
+        else:
+            if f["session"] not in sessions:
+                raise EvidenceError(f"{f['file']}: manifest entry names an unknown session")
+            if {k: f[k] for k in ("records", "checks")} != state_summary(p):
+                raise EvidenceError(f"{f['file']}: manifest records/checks differ from the state file")
+    mats, st = m["files"][:-1], m["files"][-1]
+    want = {
+        "matrix_files": len(mats),
+        "matrix_waves": sum(f["waves"] for f in mats),
+        "matrix_elements": sum(f["elements"] for f in mats),
+        "state_records": st["records"],
+        "state_checks": st["checks"],
+        "bytes": sum(f["bytes"] for f in m["files"]),
+    }
+    if m["totals"] != want:
         raise EvidenceError("manifest.json: totals do not add up")
     return m
 
