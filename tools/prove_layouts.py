@@ -1,7 +1,10 @@
-"""Milestone 1: prove wave32 operand layouts on gfx1201 hardware using exact small integers.
+"""Check the wave32 operand layouts on gfx1201 hardware with exact small integers.
 
-Tests every one of the 22 instructions (11 dense WMMA + 11 sparse SWMMAC, including
-both index_key:0 and index_key:1 on K=32 SWMMAC = 32 hardware kernels).
+Covers all 22 instructions (both index_key values on K=32 SWMMAC: 32 kernels). The waves establish
+the lane of every A row and B column, the C/D element positions, the sparse index positions and
+offsets, and that A slot k pairs with B slot k. They cannot tell K labels apart: any permutation of K
+applied to A and B together gives the same products. The K labels follow the RDNA4 ISA tables, and
+the order in which slots are accumulated is measured separately (k_order chunks, tools/k_order.py).
 """
 
 from __future__ import annotations
@@ -78,7 +81,7 @@ def decode_exact_int(raw: int, fmt: str) -> int:
 
 
 def build_dense_layout_job(spec: WmmaSpec) -> tuple[dict, list[list[list[int]]]]:
-    """Build waves that uniquely prove every A[r,k], B[k,c], C[r,c] -> D[r,c] coordinate."""
+    """Waves that locate every A row, B column and C/D element and pair A slot k with B slot k."""
     a_waves, b_waves, c_waves, expected = [], [], [], []
 
     # Wave 0: C -> D identity (0..255 all exact in f32, f16, bf16, i32)
@@ -150,16 +153,8 @@ def build_sparse_layout_job(spec: WmmaSpec, index_key: int = 0) -> tuple[dict, l
     idx_waves.append(idx_packed)
     expected.append(c0_int)
 
-    # For each compressed ka in 0..k_a-1 and each col bit in 0..3:
-    # A[r, ka] = 1 for all r; B[4*g + s, c] = (s + 1) * (2 if (c>>bit)&1 else 1) for s in 0..3 (values in 1..8?
-    # Wait: bf8 holds 1,2,3,4,6,8 exact, NOT 5 or 7; iu4 unsigned holds 0..15.
-    # Better: use B[4*g + s, c] = 2 if (s == sel and (c>>bit)&1) ... even simpler:
-    # For each ka, run 2 waves:
-    #   Wave A (tests exact selected offset s in 0..3 for every row r):
-    #     A[r, ka] = 1, B[4*g + s, c] = (s + 1) in {1, 2, 3, 4} (all exact in EVERY format incl. bf8 and iu4!)
-    #   Wave B (tests row/col identity on ka with 4 bit planes):
-    #     A[r, ka] = 2 if (r>>bit)&1 else 1, B[4*g + s, c] = 2 if (c>>bit)&1 else 1 for all s in 0..3
-    # That tests: (1) every row's exact 2-bit index in every group, (2) every A[r, ka] slot, (3) every B[kb, c] slot!
+    # Per compressed ka: one wave with A[r, ka] = 1 and B[4g + s, c] = s + 1 (exact in every format) shows
+    # each row's selected offset; four bit-plane waves (values 1 / 2) locate A[r, ka] and B[4g + s, c].
     z_c = pack_cd(spec, [[0] * 16 for _ in range(16)])
     one_a, two_a = encode_small_int(1, spec.a_fmt), encode_small_int(2, spec.a_fmt)
     one_b, two_b = encode_small_int(1, spec.b_fmt), encode_small_int(2, spec.b_fmt)
@@ -237,14 +232,14 @@ def main() -> None:
         d_waves = res[jid]
         assert len(d_waves) == len(exp_waves)
         for w_idx, exp in enumerate(exp_waves):
-            got_raw = unpack_cd(spec, d_waves[w_idx].reshape(-1))
+            got_raw = unpack_cd(spec, d_waves[w_idx].reshape(-1).tolist())
             got = [[decode_exact_int(got_raw[r][c], spec.d_fmt) for c in range(16)] for r in range(16)]
             if got != exp:
                 raise AssertionError(f"{jid} wave {w_idx} layout mismatch!\nexp[0]={exp[0]}\ngot[0]={got[0]}")
         n_el = len(exp_waves) * 256
         total_elems += n_el
         print(f"PASS layout: {jid:36s} ({len(exp_waves):3d} waves, {n_el:6d} elems)")
-    print(f"ALL {len(expected_map)} kernels (all 22 gfx1201 instructions) layout-proved: {total_elems} exact elements.")
+    print(f"All {len(expected_map)} kernels (22 instructions) match the layouts: {total_elems} exact elements.")
 
 
 if __name__ == "__main__":

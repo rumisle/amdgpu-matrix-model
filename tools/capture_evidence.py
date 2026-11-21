@@ -354,7 +354,11 @@ def main() -> None:
 
         co = args.co if args.co is not None else build_co()
         session = capture_session(co, "matrix")
-        sessions = [s for s in sessions if s["id"] != session["id"]] + [session]
+        ids = {s["id"] for s in sessions}
+        base, n = session["id"], 2
+        while session["id"] in ids:
+            session["id"], n = f"{base}.{n}", n + 1
+        sessions.append(session)
         jobs = []
         for i, p in enumerate(todo):
             job = {"id": f"j{i}", "spec": p.spec, "kernel": p.kernel, "a": p.a, "b": p.b, "c": p.c}
