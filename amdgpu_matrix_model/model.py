@@ -2,6 +2,10 @@
 
 No host floating-point arithmetic is used in any modeled result. Public functions check their
 arguments and raise ``ValueError`` for anything outside the domain documented in MODEL.md.
+
+`_shift_rne`, `pack_float`, `_align_floor`, `_acc_drops_tiny_negative` and `dot_float_step` adapt
+AMD rocjitsu's gfx12_dot.h / dot_packed16.h (MIT, Copyright (c) 2025-2026 Advanced Micro Devices, Inc.);
+see THIRD_PARTY_NOTICES.md.
 """
 
 from __future__ import annotations
@@ -10,7 +14,7 @@ import struct
 from collections.abc import Sequence
 from functools import lru_cache
 
-from .layout import check_words, pack_cd, slot_order, unpack_a, unpack_b, unpack_cd, unpack_idx
+from .layout import pack_cd, slot_order, unpack_a, unpack_b, unpack_cd, unpack_idx
 from .specs import FLOAT_FORMATS, INT_FORMATS, SPECS, FloatFormat, WmmaSpec
 
 _EMPTY_EXP = -1024  # grid of a zero product: below every reachable grid, never selected by max()
@@ -122,6 +126,12 @@ def _align_floor(sig: int, exp: int, neg: int, grid: int, zero_if_empty: bool) -
     return mag
 
 
+def _acc_drops_tiny_negative(grid: int, d_fmt: FloatFormat) -> bool:
+    """A negative accumulator shifted completely below the grid contributes 0 while the grid is above
+    the D format's emin, and the ordinary floor (-1 grid unit) at or below it (measured, all D formats)."""
+    return grid > d_fmt.emin
+
+
 def dot_float_step(
     a_words: Sequence[int],
     b_words: Sequence[int],
@@ -186,9 +196,7 @@ def dot_float_step(
     c_grid = max(c_lead, d_fmt.emin) - 26
     grid = p_grid if p_grid > c_grid else c_grid
 
-    # A negative accumulator shifted completely below the grid contributes 0 while the grid is above
-    # the D format's emin, and the ordinary floor (-1 unit) at or below it.
-    total = _align_floor(csig, cve, csg, grid, grid > d_fmt.emin)
+    total = _align_floor(csig, cve, csg, grid, _acc_drops_tiny_negative(grid, d_fmt))
     n = len(prods)
     for base in range(0, n, subgroup):
         sg = max(grids[base : base + subgroup])

@@ -30,7 +30,6 @@ from amdgpu_matrix_model.evidence import (  # noqa: E402
     CONTROL_OPERANDS,
     CONTROL_RESULTS,
     CONTROL_WRITES,
-    DEFAULT_MODE,
     EXEC_MASKS,
     STATE_FILE,
     STATE_PREFILL,

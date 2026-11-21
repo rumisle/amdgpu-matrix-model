@@ -38,7 +38,6 @@ from amdgpu_matrix_model.evidence import (  # noqa: E402
     sha256_file,
     write_matrix_file,
 )
-from amdgpu_matrix_model.layout import pack_a, pack_b, pack_cd  # noqa: E402
 from amdgpu_matrix_model.specs import SPECS, WmmaSpec  # noqa: E402
 from tools import cases  # noqa: E402
 from tools.cases import bf16_bits as _bf16_bits  # noqa: E402
