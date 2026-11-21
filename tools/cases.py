@@ -185,6 +185,8 @@ def tiny_acc_cases(spec: WmmaSpec) -> list[Case]:
     steps = step_schedule(spec)
     d_lo, d_hi = exp_range(spec.d_fmt)
     levels = {"f16": (2, 6, 10, 11, 16, 30), "f32": (-40, -10, 0, 30), "bf16": (-120, -100, 0, 30)}[spec.d_fmt]
+    if spec.a_fmt == "bf16":  # grids at and just above emin = -126 of f32 / bf16 D
+        levels += (-110, -104, -102, -101)
     out = []
     for step in (steps[0], steps[-1]):
         for ep in levels:
