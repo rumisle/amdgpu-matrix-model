@@ -55,7 +55,7 @@ from .model import wmma_wave
 from .specs import SPECS, WmmaSpec
 
 # SHA-256 of evidence/manifest.json of this release. The manifest in turn pins every evidence file.
-RELEASE_MANIFEST_SHA256 = "0000000000000000000000000000000000000000000000000000000000000000"
+RELEASE_MANIFEST_SHA256 = "6240d170cffb038489b32ffa3d192af5312eade08f1aa3087467eb68f93bf8a5"
 
 WaveModel = Callable[..., list[int]]  # signature of model.wmma_wave
 
